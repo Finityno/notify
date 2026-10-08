@@ -212,11 +212,35 @@ pub struct INotifyWatcher {
     waker: Arc<mio::Waker>,
 }
 
+/// A batched op with its path already resolved on the caller's thread, as `watch_inner` and
+/// `unwatch_inner` do, so a working-directory change while the loop is busy cannot retarget a
+/// relative path. The original op is kept for error reporting.
+struct ResolvedPathOp {
+    op: PathOp,
+    target: Result<ResolvedTarget>,
+}
+
+enum ResolvedTarget {
+    Watch(WatchPath, WatchPathConfig),
+    Unwatch(PathBuf),
+}
+
+impl ResolvedPathOp {
+    fn new(op: PathOp) -> Self {
+        let target = match &op {
+            PathOp::Watch(path, config) => WatchPath::new(path)
+                .map(|watch_path| ResolvedTarget::Watch(watch_path, config.clone())),
+            PathOp::Unwatch(path) => absolute_path(path).map(ResolvedTarget::Unwatch),
+        };
+        Self { op, target }
+    }
+}
+
 enum EventLoopMsg {
     AddWatch(WatchPath, WatchPathConfig, Sender<Result<()>>),
     RemoveWatch(PathBuf, Sender<Result<()>>),
     /// A whole [`Watcher::update_paths`] batch, applied in one visit to the loop.
-    UpdatePaths(Vec<PathOp>, Sender<StdResult<(), UpdatePathsError>>),
+    UpdatePaths(Vec<ResolvedPathOp>, Sender<StdResult<(), UpdatePathsError>>),
     GetWatchedPaths(Sender<Vec<(PathBuf, RecursiveMode)>>),
     Shutdown,
     Configure(Config, BoundSender<Result<bool>>),
@@ -415,15 +439,24 @@ impl EventLoop {
     /// Applies each operation exactly as `AddWatch`/`RemoveWatch` would, in order, stopping at the
     /// first failure. Sharing [`crate::update_paths`] with the trait's default keeps the error
     /// contract identical: the failed op is `origin`, the unattempted ones are `remaining`.
-    fn update_paths(&mut self, ops: Vec<PathOp>) -> StdResult<(), UpdatePathsError> {
-        crate::update_paths(ops, |op| match op {
-            PathOp::Watch(path, config) => WatchPath::new(&path)
-                .and_then(|watch_path| self.add_watch(watch_path, config.clone(), true))
-                .map_err(|e| (PathOp::Watch(path, config), e)),
-            PathOp::Unwatch(path) => absolute_path(&path)
-                .and_then(|absolute| self.remove_watch(absolute, false))
-                .map_err(|e| (PathOp::Unwatch(path), e)),
-        })
+    fn update_paths(&mut self, ops: Vec<ResolvedPathOp>) -> StdResult<(), UpdatePathsError> {
+        let mut ops = ops.into_iter();
+        while let Some(ResolvedPathOp { op, target }) = ops.next() {
+            let applied = target.and_then(|target| match target {
+                ResolvedTarget::Watch(watch_path, config) => {
+                    self.add_watch(watch_path, config, true)
+                }
+                ResolvedTarget::Unwatch(absolute) => self.remove_watch(absolute, false),
+            });
+            if let Err(source) = applied {
+                return Err(UpdatePathsError {
+                    source,
+                    origin: Some(op),
+                    remaining: ops.map(|remaining| remaining.op).collect(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn configure_raw_mode(&mut self, _config: Config, tx: BoundSender<Result<bool>>) {
@@ -1210,12 +1243,15 @@ impl INotifyWatcher {
         if ops.is_empty() {
             return Ok(());
         }
+        let ops = ops.into_iter().map(ResolvedPathOp::new).collect();
         let (tx, rx) = unbounded();
         if let Err(std::sync::mpsc::SendError(msg)) =
             self.channel.send(EventLoopMsg::UpdatePaths(ops, tx))
         {
             let ops = match msg {
-                EventLoopMsg::UpdatePaths(ops, _) => ops,
+                EventLoopMsg::UpdatePaths(ops, _) => {
+                    ops.into_iter().map(|resolved| resolved.op).collect()
+                }
                 _ => Vec::new(),
             };
             let source = Error::from(std::sync::mpsc::SendError(()));
@@ -2960,6 +2996,7 @@ mod tests {
                 directories
                     .iter()
                     .map(|directory| crate::PathOp::watch_non_recursive(directory.clone()))
+                    .map(super::ResolvedPathOp::new)
                     .collect(),
             )
             .expect("batch watch");
@@ -2985,6 +3022,7 @@ mod tests {
                 batched
                     .iter()
                     .map(|directory| crate::PathOp::unwatch(directory.clone()))
+                    .map(super::ResolvedPathOp::new)
                     .collect(),
             )
             .expect("batch unwatch");
