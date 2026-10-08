@@ -6,7 +6,8 @@
 
 use super::event::*;
 use super::{
-    Config, Error, ErrorKind, EventHandler, RecursiveMode, Result, WatchPathConfig, Watcher,
+    Config, Error, ErrorKind, EventHandler, PathOp, RecursiveMode, Result, StdResult,
+    UpdatePathsError, WatchPathConfig, Watcher,
 };
 use crate::paths::{
     WatchMetadata, WatchPath, absolute_path, is_preserved_watch_root, preserved_watch_mode,
@@ -99,7 +100,7 @@ struct EventLoop {
     inotify: Option<Inotify>,
     event_handler: Box<dyn EventHandler>,
     /// Absolute path -> inotify descriptor and watch metadata.
-    watches: HashMap<PathBuf, Watch>,
+    watches: Watches,
     paths: HashMap<WatchDescriptor, PathBuf>,
     rename_event: Option<Event>,
     follow_links: bool,
@@ -114,6 +115,96 @@ struct Watch {
     metadata: WatchMetadata,
 }
 
+/// Absolute path -> [`Watch`], plus how many paths currently hold each descriptor.
+///
+/// Several paths can share one descriptor (a symlink and the directory a walk reached through it
+/// resolve to the same inode), so a descriptor may only be released once its last owner is gone.
+/// Keeping the count next to the map makes that check O(1) instead of a scan over every watch,
+/// which made tearing down N watches one at a time O(N^2). Mutation goes through `insert`,
+/// `remove` and `clear` only, so the count cannot drift; reads go through `Deref`.
+#[derive(Default)]
+struct Watches {
+    by_path: HashMap<PathBuf, Watch>,
+    owner_counts: HashMap<WatchDescriptor, usize>,
+}
+
+impl Watches {
+    fn insert(&mut self, path: PathBuf, watch: Watch) -> Option<Watch> {
+        *self
+            .owner_counts
+            .entry(watch.watch_descriptor.clone())
+            .or_insert(0) += 1;
+        let previous = self.by_path.insert(path, watch);
+        if let Some(previous) = &previous {
+            self.release_owner(&previous.watch_descriptor);
+        }
+        previous
+    }
+
+    fn remove(&mut self, path: &Path) -> Option<Watch> {
+        let removed = self.by_path.remove(path);
+        if let Some(removed) = &removed {
+            self.release_owner(&removed.watch_descriptor);
+        }
+        removed
+    }
+
+    fn clear(&mut self) {
+        self.by_path.clear();
+        self.owner_counts.clear();
+    }
+
+    /// Only the metadata is handed out mutably: changing a descriptor in place would bypass the
+    /// owner count.
+    fn metadata_mut(&mut self, path: &Path) -> Option<&mut WatchMetadata> {
+        self.by_path.get_mut(path).map(|watch| &mut watch.metadata)
+    }
+
+    fn owner_count(&self, descriptor: &WatchDescriptor) -> usize {
+        self.owner_counts.get(descriptor).copied().unwrap_or(0)
+    }
+
+    fn release_owner(&mut self, descriptor: &WatchDescriptor) {
+        if let Some(count) = self.owner_counts.get_mut(descriptor) {
+            *count -= 1;
+            if *count == 0 {
+                self.owner_counts.remove(descriptor);
+            }
+        }
+    }
+
+    /// Some path other than `except` that holds `descriptor`, if any.
+    ///
+    /// Scans every watch, so callers consult [`Self::owner_count`] first and only get here when a
+    /// descriptor really is shared.
+    fn other_owner(&self, descriptor: &WatchDescriptor, except: Option<&Path>) -> Option<PathBuf> {
+        self.by_path
+            .iter()
+            .find(|(path, watch)| {
+                except.is_none_or(|except| path.as_path() != except)
+                    && &watch.watch_descriptor == descriptor
+            })
+            .map(|(path, _)| path.clone())
+    }
+}
+
+impl std::ops::Deref for Watches {
+    type Target = HashMap<PathBuf, Watch>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.by_path
+    }
+}
+
+impl<'a> IntoIterator for &'a Watches {
+    type Item = (&'a PathBuf, &'a Watch);
+    type IntoIter = std::collections::hash_map::Iter<'a, PathBuf, Watch>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.by_path.iter()
+    }
+}
+
 /// Watcher implementation based on inotify
 #[derive(Debug)]
 pub struct INotifyWatcher {
@@ -121,9 +212,35 @@ pub struct INotifyWatcher {
     waker: Arc<mio::Waker>,
 }
 
+/// A batched op with its path already resolved on the caller's thread, as `watch_inner` and
+/// `unwatch_inner` do, so a working-directory change while the loop is busy cannot retarget a
+/// relative path. The original op is kept for error reporting.
+struct ResolvedPathOp {
+    op: PathOp,
+    target: Result<ResolvedTarget>,
+}
+
+enum ResolvedTarget {
+    Watch(WatchPath, WatchPathConfig),
+    Unwatch(PathBuf),
+}
+
+impl ResolvedPathOp {
+    fn new(op: PathOp) -> Self {
+        let target = match &op {
+            PathOp::Watch(path, config) => WatchPath::new(path)
+                .map(|watch_path| ResolvedTarget::Watch(watch_path, config.clone())),
+            PathOp::Unwatch(path) => absolute_path(path).map(ResolvedTarget::Unwatch),
+        };
+        Self { op, target }
+    }
+}
+
 enum EventLoopMsg {
     AddWatch(WatchPath, WatchPathConfig, Sender<Result<()>>),
     RemoveWatch(PathBuf, Sender<Result<()>>),
+    /// A whole [`Watcher::update_paths`] batch, applied in one visit to the loop.
+    UpdatePaths(Vec<ResolvedPathOp>, Sender<StdResult<(), UpdatePathsError>>),
     GetWatchedPaths(Sender<Vec<(PathBuf, RecursiveMode)>>),
     Shutdown,
     Configure(Config, BoundSender<Result<bool>>),
@@ -218,7 +335,7 @@ impl EventLoop {
             event_loop_rx,
             inotify: Some(inotify),
             event_handler,
-            watches: HashMap::new(),
+            watches: Watches::default(),
             paths: HashMap::new(),
             rename_event: None,
             follow_links: config.follow_symlinks(),
@@ -283,6 +400,9 @@ impl EventLoop {
                 EventLoopMsg::RemoveWatch(path, tx) => {
                     let _ = tx.send(self.remove_watch(path, false));
                 }
+                EventLoopMsg::UpdatePaths(ops, tx) => {
+                    let _ = tx.send(self.update_paths(ops));
+                }
                 EventLoopMsg::GetWatchedPaths(tx) => {
                     let _ = tx.send(
                         self.watches
@@ -314,6 +434,29 @@ impl EventLoop {
                 }
             }
         }
+    }
+
+    /// Applies each operation exactly as `AddWatch`/`RemoveWatch` would, in order, stopping at the
+    /// first failure. Sharing [`crate::update_paths`] with the trait's default keeps the error
+    /// contract identical: the failed op is `origin`, the unattempted ones are `remaining`.
+    fn update_paths(&mut self, ops: Vec<ResolvedPathOp>) -> StdResult<(), UpdatePathsError> {
+        let mut ops = ops.into_iter();
+        while let Some(ResolvedPathOp { op, target }) = ops.next() {
+            let applied = target.and_then(|target| match target {
+                ResolvedTarget::Watch(watch_path, config) => {
+                    self.add_watch(watch_path, config, true)
+                }
+                ResolvedTarget::Unwatch(absolute) => self.remove_watch(absolute, false),
+            });
+            if let Err(source) = applied {
+                return Err(UpdatePathsError {
+                    source,
+                    origin: Some(op),
+                    remaining: ops.map(|remaining| remaining.op).collect(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn configure_raw_mode(&mut self, _config: Config, tx: BoundSender<Result<bool>>) {
@@ -818,13 +961,13 @@ impl EventLoop {
                     // descriptor or it keeps reporting under this path
                     if let Some(previous) = previous_descriptor.filter(|previous| *previous != w) {
                         // a walk that followed the link shares this descriptor #255
-                        let still_watched = self
-                            .watches
-                            .iter()
-                            .find(|(other, watch)| {
-                                *other != &path.absolute && watch.watch_descriptor == previous
-                            })
-                            .map(|(other, _)| other.clone());
+                        // `path.absolute` itself is one of the owners counted here.
+                        let still_watched = if self.watches.owner_count(&previous) > 1 {
+                            self.watches
+                                .other_owner(&previous, Some(path.absolute.as_path()))
+                        } else {
+                            None
+                        };
                         match still_watched {
                             Some(other) => {
                                 self.paths.insert(previous, other);
@@ -856,14 +999,6 @@ impl EventLoop {
     }
 
     fn remove_watch(&mut self, path: PathBuf, remove_recursive: bool) -> Result<()> {
-        let preserved_roots = preserved_watch_roots(
-            &path,
-            remove_recursive,
-            self.watches
-                .iter()
-                .map(|(path, watch)| (path, &watch.metadata)),
-        );
-
         let watch = self
             .watches
             .remove(&path)
@@ -872,6 +1007,16 @@ impl EventLoop {
 
         let mut removed_descriptors = vec![watch.watch_descriptor];
         if watch.metadata.is_recursive || remove_recursive {
+            // Computed here, after `path` left the map, because only this branch reads it and it
+            // is a scan over every watch. The result is the same as computing it up front: the
+            // scan already excludes `path` itself, and nothing else has changed yet.
+            let preserved_roots = preserved_watch_roots(
+                &path,
+                remove_recursive,
+                self.watches
+                    .iter()
+                    .map(|(path, watch)| (path, &watch.metadata)),
+            );
             let mut remove_list = Vec::new();
             let mut reset_list = Vec::new();
             for candidate in self.watches.keys() {
@@ -897,8 +1042,8 @@ impl EventLoop {
                 }
             }
             for path in reset_list {
-                if let Some(watch) = self.watches.get_mut(&path) {
-                    watch.metadata.is_recursive = watch.metadata.user_is_recursive;
+                if let Some(metadata) = self.watches.metadata_mut(&path) {
+                    metadata.is_recursive = metadata.user_is_recursive;
                 }
             }
         }
@@ -913,18 +1058,20 @@ impl EventLoop {
         I: IntoIterator<Item = WatchDescriptor>,
     {
         let descriptors: HashSet<_> = descriptors.into_iter().collect();
-        let mut remaining_owners = HashMap::new();
-        for (path, watch) in &self.watches {
-            if descriptors.contains(&watch.watch_descriptor) {
-                remaining_owners
-                    .entry(watch.watch_descriptor.clone())
-                    .or_insert_with(|| path.clone());
-            }
-        }
-
         for descriptor in descriptors {
-            if let Some(path) = remaining_owners.remove(&descriptor) {
-                self.paths.insert(descriptor, path);
+            if self.watches.owner_count(&descriptor) > 0 {
+                // Still shared: keep the reverse mapping if it already names a remaining owner,
+                // otherwise repoint it at one. Any remaining owner is acceptable, as before.
+                let mapped_to_owner = self.paths.get(&descriptor).is_some_and(|path| {
+                    self.watches
+                        .get(path)
+                        .is_some_and(|watch| watch.watch_descriptor == descriptor)
+                });
+                if !mapped_to_owner {
+                    if let Some(path) = self.watches.other_owner(&descriptor, None) {
+                        self.paths.insert(descriptor, path);
+                    }
+                }
                 continue;
             }
 
@@ -944,20 +1091,21 @@ impl EventLoop {
         path: PathBuf,
         remove_recursive: bool,
     ) -> Result<()> {
-        let preserved_roots = preserved_watch_roots(
-            &path,
-            remove_recursive,
-            self.watches
-                .iter()
-                .map(|(path, watch)| (path, &watch.metadata)),
-        );
-
         match self.watches.remove(&path) {
             None => return Err(Error::watch_not_found().add_path(path)),
             Some(watch) => {
                 self.paths.remove(&watch.watch_descriptor);
 
                 if watch.metadata.is_recursive || remove_recursive {
+                    // Lazily, as in `remove_watch`: the scan excludes `path` itself, so computing
+                    // it after the removal gives the same roots.
+                    let preserved_roots = preserved_watch_roots(
+                        &path,
+                        remove_recursive,
+                        self.watches
+                            .iter()
+                            .map(|(path, watch)| (path, &watch.metadata)),
+                    );
                     let mut inotify_watches =
                         self.inotify.as_mut().map(|inotify| inotify.watches());
                     let mut remove_list = Vec::new();
@@ -988,8 +1136,8 @@ impl EventLoop {
                         self.paths.remove(&w);
                     }
                     for p in reset_list {
-                        if let Some(watch) = self.watches.get_mut(&p) {
-                            watch.metadata.is_recursive = watch.metadata.user_is_recursive;
+                        if let Some(metadata) = self.watches.metadata_mut(&p) {
+                            metadata.is_recursive = metadata.user_is_recursive;
                         }
                     }
                 }
@@ -1082,6 +1230,47 @@ impl INotifyWatcher {
         rx.recv().map_err(Error::from)?
     }
 
+    /// One channel send, one wake and one reply for the whole batch, instead of one round trip
+    /// to the loop thread per path.
+    ///
+    /// Per-op results match the default [`Watcher::update_paths`]: ops run in order and the first
+    /// failure (including `MaxFilesWatch` or `PathNotFound` for that op) is returned as `origin`,
+    /// with every later op in `remaining`. The one difference is a dead loop thread: when the
+    /// channel or waker fails after the batch was handed over, it is unknown which ops ran, so
+    /// the error carries no `origin` and no `remaining`. A batch that could not be handed over at
+    /// all is returned whole, as the default would after its first op failed to send.
+    fn update_paths_inner(&mut self, ops: Vec<PathOp>) -> StdResult<(), UpdatePathsError> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let ops = ops.into_iter().map(ResolvedPathOp::new).collect();
+        let (tx, rx) = unbounded();
+        if let Err(std::sync::mpsc::SendError(msg)) =
+            self.channel.send(EventLoopMsg::UpdatePaths(ops, tx))
+        {
+            let ops = match msg {
+                EventLoopMsg::UpdatePaths(ops, _) => {
+                    ops.into_iter().map(|resolved| resolved.op).collect()
+                }
+                _ => Vec::new(),
+            };
+            let source = Error::from(std::sync::mpsc::SendError(()));
+            let mut ops = ops.into_iter();
+            return Err(UpdatePathsError {
+                source,
+                origin: ops.next(),
+                remaining: ops.collect(),
+            });
+        }
+        let lost = |source: Error| UpdatePathsError {
+            source,
+            origin: None,
+            remaining: Vec::new(),
+        };
+        self.waker.wake().map_err(|e| lost(e.into()))?;
+        rx.recv().map_err(|e| lost(e.into()))?
+    }
+
     fn watched_paths_inner(&self) -> Result<Vec<(PathBuf, RecursiveMode)>> {
         let (tx, rx) = unbounded();
         self.channel.send(EventLoopMsg::GetWatchedPaths(tx))?;
@@ -1106,6 +1295,10 @@ impl Watcher for INotifyWatcher {
 
     fn unwatch(&mut self, path: &Path) -> Result<()> {
         self.unwatch_inner(path)
+    }
+
+    fn update_paths(&mut self, ops: Vec<PathOp>) -> StdResult<(), UpdatePathsError> {
+        self.update_paths_inner(ops)
     }
 
     fn configure(&mut self, config: Config) -> Result<bool> {
@@ -2611,6 +2804,300 @@ mod tests {
             reported.is_empty(),
             "the destination is still reported after the caller asked not to follow the link: \
              {reported:?}"
+        );
+    }
+
+    /// Every descriptor's owner count equals the number of paths that hold it.
+    fn assert_owner_counts_consistent(event_loop: &EventLoop) {
+        let mut expected = std::collections::HashMap::new();
+        for watch in event_loop.watches.values() {
+            *expected.entry(watch.watch_descriptor.clone()).or_insert(0) += 1;
+        }
+        assert_eq!(event_loop.watches.owner_counts, expected);
+    }
+
+    #[test]
+    fn removing_one_owner_of_a_shared_descriptor_keeps_it_for_the_other() {
+        let tmpdir = tempfile::tempdir().expect("tmpdir");
+        let destination = tmpdir.path().join("destination");
+        std::fs::create_dir(&destination).expect("create destination");
+        let link = tmpdir.path().join("link");
+        std::os::unix::fs::symlink(&destination, &link).expect("symlink");
+
+        let (tx, rx) = mpsc::channel();
+        let inotify = super::inotify_sys::Inotify::init().expect("inotify");
+        let mut event_loop =
+            EventLoop::new(inotify, Box::new(tx), &Config::default()).expect("event loop");
+        event_loop
+            .add_watch(
+                WatchPath::new(&destination).unwrap(),
+                non_recursive_watch(),
+                true,
+            )
+            .expect("watch destination");
+        event_loop
+            .add_watch(WatchPath::new(&link).unwrap(), non_recursive_watch(), true)
+            .expect("watch link");
+
+        let descriptor = event_loop.watches[&destination].watch_descriptor.clone();
+        assert_eq!(
+            event_loop.watches[&link].watch_descriptor, descriptor,
+            "a dereferenced link to a watched directory shares its inotify descriptor"
+        );
+        assert_eq!(event_loop.watches.owner_count(&descriptor), 2);
+        assert_owner_counts_consistent(&event_loop);
+
+        event_loop
+            .remove_watch(destination.clone(), false)
+            .expect("unwatch destination");
+        assert_eq!(event_loop.watches.owner_count(&descriptor), 1);
+        assert_eq!(event_loop.paths.get(&descriptor), Some(&link));
+        assert_owner_counts_consistent(&event_loop);
+
+        // The kernel watch must survive and now report through the remaining owner.
+        let file = destination.join("file");
+        std::fs::write(&file, "123").expect("write");
+        event_loop.handle_inotify();
+        let reported: Vec<_> = rx
+            .try_iter()
+            .filter_map(|event: Result<Event>| event.ok())
+            .flat_map(|event| event.paths)
+            .collect();
+        assert!(
+            reported.contains(&link.join("file")),
+            "the shared descriptor stopped reporting after one owner was removed: {reported:?}"
+        );
+
+        event_loop
+            .remove_watch(link.clone(), false)
+            .expect("unwatch link");
+        assert_eq!(event_loop.watches.owner_count(&descriptor), 0);
+        assert!(event_loop.paths.is_empty());
+        assert_owner_counts_consistent(&event_loop);
+        let remove_result = event_loop
+            .inotify
+            .as_mut()
+            .expect("inotify instance")
+            .watches()
+            .remove(descriptor);
+        assert_eq!(
+            remove_result.unwrap_err().raw_os_error(),
+            Some(libc::EINVAL),
+            "removing the last owner must release the kernel watch"
+        );
+    }
+
+    #[test]
+    fn update_paths_batch_adds_then_events_arrive() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = watcher_with_data_events();
+        let directories: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|name| tmpdir.path().join(name))
+            .collect();
+        let files: Vec<_> = directories
+            .iter()
+            .map(|directory| {
+                std::fs::create_dir(directory).expect("create dir");
+                let file = directory.join("file");
+                std::fs::write(&file, "").expect("create file");
+                file
+            })
+            .collect();
+
+        watcher
+            .watcher
+            .update_paths(
+                directories
+                    .iter()
+                    .map(|directory| crate::PathOp::watch_non_recursive(directory.clone()))
+                    .collect(),
+            )
+            .expect("batch watch");
+
+        for file in &files {
+            std::fs::write(file, "123").expect("write");
+        }
+        rx.wait_unordered_exact(
+            files
+                .iter()
+                .map(|file| expected(file).modify_data_any().multiple()),
+        );
+
+        let mut watched: Vec<_> = watcher
+            .watcher
+            .watched_paths()
+            .expect("watched paths")
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        watched.sort();
+        assert_eq!(watched, directories);
+    }
+
+    #[test]
+    fn update_paths_stops_at_the_first_failing_op_like_the_default() {
+        let tmpdir = testdir();
+        let (mut watcher, _rx) = watcher_with_data_events();
+        let first = tmpdir.path().join("first");
+        let last = tmpdir.path().join("last");
+        let missing = tmpdir.path().join("missing");
+        std::fs::create_dir(&first).expect("create");
+        std::fs::create_dir(&last).expect("create");
+        watcher.watch_nonrecursively(&first);
+        watcher.watch_nonrecursively(&last);
+
+        let error = watcher
+            .watcher
+            .update_paths(vec![
+                crate::PathOp::unwatch(first.clone()),
+                crate::PathOp::watch_non_recursive(missing.clone()),
+                crate::PathOp::unwatch(last.clone()),
+            ])
+            .expect_err("watching a missing path fails");
+
+        assert!(matches!(error.source.kind, ErrorKind::PathNotFound));
+        assert!(
+            matches!(&error.origin, Some(crate::PathOp::Watch(path, _)) if path == &missing),
+            "origin: {:?}",
+            error.origin
+        );
+        assert_eq!(error.remaining.len(), 1);
+        assert!(matches!(&error.remaining[0], crate::PathOp::Unwatch(path) if path == &last));
+
+        let watched: Vec<_> = watcher
+            .watcher
+            .watched_paths()
+            .expect("watched paths")
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(
+            watched,
+            vec![last],
+            "ops before the failure ran, ops after it did not"
+        );
+    }
+
+    #[test]
+    fn tearing_down_many_watches_releases_every_descriptor() {
+        let tmpdir = tempfile::tempdir().expect("tmpdir");
+        let directories: Vec<_> = (0..500)
+            .map(|index| {
+                let directory = tmpdir.path().join(format!("dir-{index}"));
+                std::fs::create_dir(&directory).expect("create dir");
+                directory
+            })
+            .collect();
+
+        let mut event_loop = test_event_loop();
+        event_loop
+            .update_paths(
+                directories
+                    .iter()
+                    .map(|directory| crate::PathOp::watch_non_recursive(directory.clone()))
+                    .map(super::ResolvedPathOp::new)
+                    .collect(),
+            )
+            .expect("batch watch");
+        assert_eq!(event_loop.watches.len(), directories.len());
+        assert_eq!(event_loop.paths.len(), directories.len());
+        assert_owner_counts_consistent(&event_loop);
+        let descriptors: Vec<_> = event_loop
+            .watches
+            .values()
+            .map(|watch| watch.watch_descriptor.clone())
+            .collect();
+
+        // Remove half one at a time and half as a batch, so both paths are covered.
+        let (single, batched) = directories.split_at(directories.len() / 2);
+        for directory in single {
+            event_loop
+                .remove_watch(directory.clone(), false)
+                .expect("unwatch");
+        }
+        assert_owner_counts_consistent(&event_loop);
+        event_loop
+            .update_paths(
+                batched
+                    .iter()
+                    .map(|directory| crate::PathOp::unwatch(directory.clone()))
+                    .map(super::ResolvedPathOp::new)
+                    .collect(),
+            )
+            .expect("batch unwatch");
+
+        assert!(event_loop.watches.is_empty());
+        assert!(event_loop.watches.owner_counts.is_empty());
+        assert!(event_loop.paths.is_empty());
+        let mut inotify_watches = event_loop.inotify.as_mut().expect("inotify").watches();
+        for descriptor in descriptors {
+            assert_eq!(
+                inotify_watches.remove(descriptor).unwrap_err().raw_os_error(),
+                Some(libc::EINVAL),
+                "every kernel watch must have been released"
+            );
+        }
+    }
+
+    /// Times adding and removing many non-recursive watches through `watch`/`unwatch` one at a
+    /// time and through one `update_paths` batch each way. Ignored by default; run with
+    /// `cargo test -p notify --lib --release bench_non_recursive_watch_churn -- --ignored --nocapture`.
+    /// `NOTIFY_BENCH_WATCHES` overrides the count (default 10000).
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_non_recursive_watch_churn() {
+        let count: usize = std::env::var("NOTIFY_BENCH_WATCHES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10_000);
+        let tmpdir = tempfile::tempdir().expect("tmpdir");
+        let directories: Vec<_> = (0..count)
+            .map(|index| {
+                let directory = tmpdir.path().join(format!("dir-{index}"));
+                std::fs::create_dir(&directory).expect("create dir");
+                directory
+            })
+            .collect();
+
+        let mut watcher = INotifyWatcher::new(|_| {}, Config::default()).expect("watcher");
+        let start = std::time::Instant::now();
+        for directory in &directories {
+            watcher
+                .watch(directory, RecursiveMode::NonRecursive)
+                .expect("watch");
+        }
+        let single_add = start.elapsed();
+        let start = std::time::Instant::now();
+        for directory in &directories {
+            watcher.unwatch(directory).expect("unwatch");
+        }
+        let single_remove = start.elapsed();
+
+        let start = std::time::Instant::now();
+        watcher
+            .update_paths(
+                directories
+                    .iter()
+                    .map(|directory| crate::PathOp::watch_non_recursive(directory.clone()))
+                    .collect(),
+            )
+            .expect("batch watch");
+        let batched_add = start.elapsed();
+        let start = std::time::Instant::now();
+        watcher
+            .update_paths(
+                directories
+                    .iter()
+                    .map(|directory| crate::PathOp::unwatch(directory.clone()))
+                    .collect(),
+            )
+            .expect("batch unwatch");
+        let batched_remove = start.elapsed();
+
+        println!(
+            "{count} non-recursive watches: single add {single_add:?}, single remove \
+             {single_remove:?}, batched add {batched_add:?}, batched remove {batched_remove:?}"
         );
     }
 }
