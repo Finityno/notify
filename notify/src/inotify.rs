@@ -826,7 +826,7 @@ impl EventLoop {
         // If the watch is not recursive, or if we determine (by stat'ing the path to get its
         // metadata) that the watched path is not a directory, add a single path watch.
         if !requested_is_recursive {
-            return self.add_single_watch(path, false, dereference, true);
+            return self.add_single_watch(path, false, dereference, true, path_is_dir);
         }
 
         let root = path.clone();
@@ -850,6 +850,9 @@ impl EventLoop {
             .collect()
     }
 
+    /// Every path must be a directory once resolved: callers pass the output of
+    /// `recursive_directory_paths`, which yields only directories, so the watch records
+    /// `is_dir` without a stat of its own.
     fn add_watches_for_paths<I>(
         &mut self,
         paths: I,
@@ -864,7 +867,7 @@ impl EventLoop {
             // entries below the root were reached by following links, so they observe what they
             // resolved to
             let entry_dereference = if watch_self { dereference } else { true };
-            match self.add_single_watch(path, is_recursive, entry_dereference, watch_self) {
+            match self.add_single_watch(path, is_recursive, entry_dereference, watch_self, true) {
                 Ok(()) => {}
                 // TOCTOU: a subdirectory can disappear between walkdir listing it and us adding an
                 // inotify watch for it. This should not fail the overall recursive watch call.
@@ -883,6 +886,7 @@ impl EventLoop {
         is_recursive: bool,
         requested_dereference: bool,
         watch_self: bool,
+        is_dir: bool,
     ) -> Result<()> {
         // Build watch mask from configured event kinds for kernel-level filtering
         let mut watchmask = event_kind_mask_to_watch_mask(self.event_kind_mask, is_recursive);
@@ -929,15 +933,6 @@ impl EventLoop {
                 }
                 Ok(w) => {
                     debug_assert!(!watchmask.intersects(RESOLUTION_FLAGS));
-                    let is_dir = match watch_metadata(&path.absolute, dereference) {
-                        Ok(metadata) => metadata.is_dir(),
-                        Err(e) => {
-                            // Avoid leaking an inotify watch if we can't stat after adding it.
-                            // This can happen due to racy deletions.
-                            let _ = inotify.watches().remove(w.clone());
-                            return Err(Error::io_watch(e).add_path(path.requested));
-                        }
-                    };
                     let metadata = if let Some(existing_watch) = existing_watch {
                         WatchMetadata::new(
                             &path,
@@ -2640,6 +2635,45 @@ mod tests {
         let watch = event_loop.watches.get(&link).expect("link watch");
         assert!(!watch.is_dir);
         assert!(!watch.dereference);
+    }
+
+    #[test]
+    fn watches_record_whether_the_path_is_a_directory() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().to_path_buf();
+        let directory = root.join("directory");
+        let nested = directory.join("nested");
+        let file = root.join("file");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(&file, b"").unwrap();
+        let file_link = root.join("file_link");
+        let directory_link = root.join("directory_link");
+        std::os::unix::fs::symlink(&file, &file_link).unwrap();
+        std::os::unix::fs::symlink(&directory, &directory_link).unwrap();
+
+        let mut event_loop = test_event_loop();
+        event_loop
+            .add_watch(WatchPath::new(&file).unwrap(), non_recursive_watch(), true)
+            .unwrap();
+        event_loop
+            .add_watch(WatchPath::new(&file_link).unwrap(), non_recursive_watch(), true)
+            .unwrap();
+        event_loop
+            .add_watch(
+                WatchPath::new(&directory_link).unwrap(),
+                non_recursive_watch().with_dereference_symlinks(false),
+                true,
+            )
+            .unwrap();
+        event_loop
+            .add_watch(WatchPath::new(&directory).unwrap(), recursive_watch(), true)
+            .unwrap();
+
+        assert!(!event_loop.watches.get(&file).unwrap().is_dir);
+        assert!(!event_loop.watches.get(&file_link).unwrap().is_dir);
+        assert!(!event_loop.watches.get(&directory_link).unwrap().is_dir);
+        assert!(event_loop.watches.get(&directory).unwrap().is_dir);
+        assert!(event_loop.watches.get(&nested).unwrap().is_dir);
     }
 
     #[test]
