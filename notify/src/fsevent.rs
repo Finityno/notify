@@ -30,8 +30,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 bitflags::bitflags! {
   #[repr(C)]
@@ -132,7 +133,59 @@ impl Drop for FseventsPathReservation {
 struct RunLoopHandle {
     runloop: cf::CFRetained<cf::CFRunLoop>,
     stop_source: cf::CFRetained<cf::CFRunLoopSource>,
+    flush_source: cf::CFRetained<cf::CFRunLoopSource>,
     thread_handle: thread::JoinHandle<()>,
+    progress: Arc<StreamProgress>,
+}
+
+// Flush requests from `restart` and their completions by the flush source's
+// perform on the stream's runloop thread; `restart` waits on it before stopping
+// the stream.
+#[derive(Debug, Default)]
+struct StreamProgress {
+    state: Mutex<FlushState>,
+    changed: Condvar,
+}
+
+// Completion is tracked by request generation, not by event id: `RootChanged`
+// events carry id 0, so no id comparison can tell whether one is still pending.
+#[derive(Debug, Default)]
+struct FlushState {
+    requested: u64,
+    completed: u64,
+}
+
+impl FlushState {
+    fn request(&mut self) -> u64 {
+        self.requested += 1;
+        self.requested
+    }
+
+    // Taken before the flush starts, so a request made while it runs is not
+    // reported complete by it.
+    fn pending(&self) -> u64 {
+        self.requested
+    }
+
+    fn complete(&mut self, generation: u64) {
+        self.completed = self.completed.max(generation);
+    }
+
+    fn is_complete(&self, generation: u64) -> bool {
+        self.completed >= generation
+    }
+}
+
+// Bounds how long a swap waits for the old stream's flushed events to pass
+// through the event handler. Hitting it means the handler or fseventsd is
+// wedged; the swap then goes ahead without the guarantee rather than hanging the
+// watch call.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl fmt::Debug for FsEventWatcher {
@@ -390,6 +443,28 @@ unsafe extern "C-unwind" fn stop_runloop_perform(_info: *mut std::ffi::c_void) {
     }
 }
 
+// What the flush source's perform needs. Owned by the runloop thread, which
+// invalidates the source before dropping it.
+struct FlushSourceInfo {
+    stream: fs::FSEventStreamRef,
+    progress: Arc<StreamProgress>,
+}
+
+// Runs on the watcher thread, the thread the stream is scheduled on, so the
+// stream is only ever touched there. `FSEventStreamFlushSync` hands everything
+// the stream holds back for `latency`, or has received but not yet delivered, to
+// the callback before it returns; the callback runs nested here, on the same
+// thread as every other delivery. No lock is held across it: the callback takes
+// only the event handler's mutex, and `flush_handle` takes `progress.state` only
+// briefly.
+unsafe extern "C-unwind" fn flush_stream_perform(info: *mut std::ffi::c_void) {
+    let info = unsafe { &*(info as *const FlushSourceInfo) };
+    let generation = lock_ignoring_poison(&info.progress.state).pending();
+    unsafe { fs::FSEventStreamFlushSync(info.stream) };
+    lock_ignoring_poison(&info.progress.state).complete(generation);
+    info.progress.changed.notify_all();
+}
+
 impl FsEventWatcher {
     fn from_event_handler(
         event_handler: Arc<Mutex<dyn EventHandler>>,
@@ -461,17 +536,29 @@ impl FsEventWatcher {
     // set. The new stream is started before the old one is stopped, so that a
     // stream is watching at every moment: events firing inside a stop-then-start
     // window would be silently dropped for every watched path, not just the one
-    // being (un)watched. An event can be delivered through both streams during
-    // the swap; duplicates are fine, losses are not. Resuming the new stream
-    // from an older event id was tried and made things worse: historical replay
-    // stalls live delivery. If the new stream fails to start, the old one is
-    // kept running so the previous path set keeps delivering events.
+    // being (un)watched. Stopping a stream also drops whatever it still holds
+    // back for `latency` and any delivery its runloop has not run yet, so once
+    // the new stream is running the old one is flushed (see `flush_handle`)
+    // before it is stopped. Every event that occurred before the new stream
+    // started is then either already through the old stream's handler or covered
+    // by the new stream; resuming the new stream from an older event id instead
+    // was tried and made things worse: historical replay stalls live delivery.
+    // An event can be delivered through both streams during the swap;
+    // duplicates are fine, losses are not. If the new stream fails to start, the
+    // old one is kept running so the previous path set keeps delivering events.
     fn restart(&mut self) -> Result<()> {
         let old_runloop = self.runloop.take();
         let result = self.run();
         match &result {
             Ok(()) => {
                 if let Some(handle) = old_runloop {
+                    // With no replacement stream there is nobody to hand over to,
+                    // and the remaining paths were all unwatched.
+                    if self.runloop.is_some() && !Self::flush_handle(&handle, FLUSH_TIMEOUT) {
+                        log::warn!(
+                            "FSEvents stream did not flush within {FLUSH_TIMEOUT:?}; events it held back may be lost"
+                        );
+                    }
                     Self::stop_handle(handle);
                 }
             }
@@ -493,11 +580,48 @@ impl FsEventWatcher {
         }
     }
 
+    // Has the old stream hand everything it holds to the event handler, and waits
+    // until the handler is through it. Returns false if that did not happen
+    // within `timeout`.
+    //
+    // The stream is flushed on its own runloop thread, which is alive until
+    // `stop_handle` signals it, so the request cannot be lost. Only the caller of
+    // `watch`/`unwatch` blocks, never the runloop; if that caller is the runloop
+    // thread itself (a watch call from inside the event handler) waiting would
+    // deadlock, so the flush is skipped.
+    fn flush_handle(handle: &RunLoopHandle, timeout: Duration) -> bool {
+        if handle.thread_handle.thread().id() == thread::current().id() {
+            return false;
+        }
+        let deadline = Instant::now() + timeout;
+        // Requested before signalling, so a completion of an earlier flush cannot
+        // satisfy this one.
+        let generation = lock_ignoring_poison(&handle.progress.state).request();
+        handle.flush_source.signal();
+        handle.runloop.wake_up();
+
+        let mut state = lock_ignoring_poison(&handle.progress.state);
+        while !state.is_complete(generation) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            state = handle
+                .progress
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+        true
+    }
+
     fn stop_handle(handle: RunLoopHandle) {
         let RunLoopHandle {
             runloop,
             stop_source,
             thread_handle,
+            ..
         } = handle;
         {
             // Calling `CFRunLoopStop` directly here would race: it only takes effect
@@ -646,6 +770,7 @@ impl FsEventWatcher {
         struct CFRunLoopSendWrapper(
             cf::CFRetained<cf::CFRunLoop>,
             cf::CFRetained<cf::CFRunLoopSource>,
+            cf::CFRetained<cf::CFRunLoopSource>,
         );
 
         // Safety:
@@ -667,6 +792,8 @@ impl FsEventWatcher {
         // channel to pass runloop around
         let (rl_tx, rl_rx) = unbounded();
 
+        let progress = Arc::new(StreamProgress::default());
+        let flush_progress = progress.clone();
         let thread_handle = thread::Builder::new()
             .name("notify-rs fsevents loop".to_string())
             .spawn(move || {
@@ -721,16 +848,49 @@ impl FsEventWatcher {
                     .expect("Failed to create stop source");
                     cur_runloop.add_source(Some(&stop_source), cf::kCFRunLoopDefaultMode);
 
+                    // The source through which `restart` asks this thread to flush the
+                    // stream before it is replaced; see `flush_handle`. `flush_info`
+                    // outlives the source, which is invalidated before it is dropped.
+                    let mut flush_info = FlushSourceInfo {
+                        stream,
+                        progress: flush_progress,
+                    };
+                    let mut flush_source_context = cf::CFRunLoopSourceContext {
+                        version: 0,
+                        info: &mut flush_info as *mut FlushSourceInfo as *mut libc::c_void,
+                        retain: None,
+                        release: None,
+                        copyDescription: None,
+                        equal: None,
+                        hash: None,
+                        schedule: None,
+                        cancel: None,
+                        perform: Some(flush_stream_perform),
+                    };
+                    let flush_source = cf::CFRunLoopSource::new(
+                        cf::kCFAllocatorDefault,
+                        0,
+                        &mut flush_source_context,
+                    )
+                    .expect("Failed to create flush source");
+                    cur_runloop.add_source(Some(&flush_source), cf::kCFRunLoopDefaultMode);
+
                     // `stop()` will signal `stop_source`, wake the runloop, and then join
                     // this thread.
                     rl_tx
-                        .send(Ok(CFRunLoopSendWrapper(cur_runloop, stop_source.clone())))
+                        .send(Ok(CFRunLoopSendWrapper(
+                            cur_runloop,
+                            stop_source.clone(),
+                            flush_source.clone(),
+                        )))
                         .expect("Unable to send runloop to watcher");
 
                     // Block until the pending signal on `stop_source` (if any) or a later
                     // one stops the loop from the inside; see `stop()`.
                     cf::CFRunLoop::run();
 
+                    flush_source.invalidate();
+                    drop(flush_info);
                     stop_source.invalidate();
                     fs::FSEventStreamStop(stream);
                     fs::FSEventStreamInvalidate(stream);
@@ -758,7 +918,9 @@ impl FsEventWatcher {
         self.runloop = Some(RunLoopHandle {
             runloop: runloop_wrapper.0,
             stop_source: runloop_wrapper.1,
+            flush_source: runloop_wrapper.2,
             thread_handle,
+            progress,
         });
 
         Ok(())
@@ -833,31 +995,8 @@ unsafe fn callback_impl(
             log::trace!("unknown FSEventStreamEventFlags bits: 0x{unknown_bits:08x}");
         }
 
-        let mut watch_match = None;
-        for (watch_path, watch_info) in &(*info).recursive_info {
-            if path.starts_with(watch_path) {
-                let matches_watch = if watch_info.is_recursive || path == watch_path {
-                    true
-                } else if let Some(parent_path) = path.parent() {
-                    parent_path == watch_path
-                } else {
-                    false
-                };
-
-                if matches_watch
-                    && watch_match.as_ref().is_none_or(
-                        |(matched_path, _): &(&PathBuf, &WatchInfo)| {
-                            watch_path.as_os_str().as_bytes().len()
-                                > matched_path.as_os_str().as_bytes().len()
-                        },
-                    )
-                {
-                    watch_match = Some((watch_path, watch_info));
-                }
-            }
-        }
-
-        let Some((watch_path, watch_info)) = watch_match else {
+        let Some((watch_path, watch_info)) = find_watch(path, unsafe { &(*info).recursive_info })
+        else {
             continue;
         };
         let translated_count = translated_event_count(&flag, true);
@@ -901,6 +1040,36 @@ unsafe fn callback_impl(
             });
         });
     }
+}
+
+// The deepest watch that covers `path`: a recursive watch covers its whole
+// subtree, a non-recursive one only itself and its direct children.
+fn find_watch<'a>(
+    path: &Path,
+    watches: &'a HashMap<PathBuf, WatchInfo>,
+) -> Option<(&'a PathBuf, &'a WatchInfo)> {
+    let mut watch_match: Option<(&PathBuf, &WatchInfo)> = None;
+    for (watch_path, watch_info) in watches {
+        if path.starts_with(watch_path) {
+            let matches_watch = if watch_info.is_recursive || path == watch_path {
+                true
+            } else if let Some(parent_path) = path.parent() {
+                parent_path == watch_path
+            } else {
+                false
+            };
+
+            if matches_watch
+                && watch_match.is_none_or(|(matched_path, _)| {
+                    watch_path.as_os_str().as_bytes().len()
+                        > matched_path.as_os_str().as_bytes().len()
+                })
+            {
+                watch_match = Some((watch_path, watch_info));
+            }
+        }
+    }
+    watch_match
 }
 
 impl Watcher for FsEventWatcher {
@@ -1115,6 +1284,37 @@ mod tests {
         std::fs::File::create_new(&path).expect("create");
 
         rx.wait_unordered([expected(path).create_file()]);
+    }
+
+    // With `NoDefer`, the first event after a quiet period is delivered at once
+    // and the next is held for the latency; watching another path in that
+    // window replaces the stream, which must not drop the held event.
+    #[test]
+    fn event_held_for_latency_survives_a_stream_swap() {
+        let tmpdir = testdir();
+        let watched = tmpdir.path().join("watched");
+        let added = tmpdir.path().join("added");
+        std::fs::create_dir(&watched).expect("create watched");
+        std::fs::create_dir(&added).expect("create added");
+
+        let (mut watcher, mut rx) = channel_with_config::<FsEventWatcher>(
+            ChannelConfig::default()
+                .with_timeout(Duration::from_secs(10))
+                .with_watcher_config(
+                    Config::default().with_fsevent_latency(Duration::from_secs(2)),
+                ),
+        );
+        watcher.watch_recursively(&watched);
+
+        let first = watched.join("first");
+        std::fs::File::create_new(&first).expect("create first");
+        rx.wait_unordered([expected(&first).create_file()]);
+
+        let held = watched.join("held");
+        std::fs::File::create_new(&held).expect("create held");
+        watcher.watch_recursively(&added);
+
+        rx.wait_unordered([expected(held).create_file()]);
     }
 
     #[test]
@@ -1409,6 +1609,44 @@ mod tests {
         assert!(res.is_ok(), "callback_impl should not panic");
 
         rx.try_iter().collect()
+    }
+
+    #[test]
+    fn flush_waits_for_its_own_generation() {
+        let mut state = FlushState::default();
+
+        let first = state.request();
+        assert!(!state.is_complete(first), "nothing has been flushed yet");
+
+        // A flush already running when the second request arrives took its
+        // generation before that request, so it must not complete it.
+        let running = state.pending();
+        let second = state.request();
+        state.complete(running);
+        assert!(state.is_complete(first));
+        assert!(!state.is_complete(second));
+
+        let next = state.pending();
+        state.complete(next);
+        assert!(state.is_complete(second));
+
+        // A late completion from an older flush never moves the counter back.
+        state.complete(running);
+        assert!(state.is_complete(second));
+    }
+
+    // Signals to a runloop source coalesce, so one perform can answer several
+    // requests.
+    #[test]
+    fn one_flush_completes_every_request_made_before_it() {
+        let mut state = FlushState::default();
+        let first = state.request();
+        let second = state.request();
+
+        let generation = state.pending();
+        state.complete(generation);
+        assert!(state.is_complete(first));
+        assert!(state.is_complete(second));
     }
 
     #[test]
