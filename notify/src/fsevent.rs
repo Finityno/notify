@@ -32,6 +32,7 @@ use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 bitflags::bitflags! {
   #[repr(C)]
@@ -133,6 +134,62 @@ struct RunLoopHandle {
     runloop: cf::CFRetained<cf::CFRunLoop>,
     stop_source: cf::CFRetained<cf::CFRunLoopSource>,
     thread_handle: thread::JoinHandle<()>,
+    progress: Arc<Mutex<StreamProgress>>,
+    recursive_info: Arc<HashMap<PathBuf, WatchInfo>>,
+}
+
+// How far a stream has delivered, shared between its callback (on the stream's
+// runloop thread) and `restart`, which reads it to decide where the replacement
+// stream resumes.
+#[derive(Clone, Copy, Debug)]
+struct StreamProgress {
+    // The newest event id the callback has seen, or, before the first callback,
+    // the id the stream started from. Every event this stream still owes has a
+    // larger id.
+    event_id: fs::FSEventStreamEventId,
+    // When `event_id` last advanced, or when the stream was created.
+    updated_at: Instant,
+    // Created with a historical `since_when` and the `HistoryDone` sentinel has
+    // not arrived yet, so older events may still be owed however long ago the
+    // last callback ran.
+    history_pending: bool,
+}
+
+// Slack on top of the stream latency for a delivery that FSEvents has already
+// sent but the runloop has not run yet.
+const REPLAY_GRACE: Duration = Duration::from_secs(1);
+
+// The id a replacement stream must resume from so that nothing the previous
+// stream still owes is lost, or `None` when starting from "now" is enough.
+//
+// With `NoDefer`, an event after a quiet period is delivered immediately and
+// later ones are held for `latency` after each delivery; stopping the stream
+// drops whatever it holds. So events are owed only while a delivery happened
+// within the last `latency` (or a replay is still in progress), and only then is
+// history replayed. An idle stream resumes from now, which keeps a watch call on
+// a long-quiet watcher from reading the volume's event history since it last
+// changed.
+fn replay_since(
+    progress: StreamProgress,
+    now: Instant,
+    latency: Duration,
+) -> Option<fs::FSEventStreamEventId> {
+    let recent = now.saturating_duration_since(progress.updated_at) <= latency + REPLAY_GRACE;
+    (progress.history_pending || recent).then_some(progress.event_id)
+}
+
+fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+// Events with ids up to `until` predate the watch call that created the stream.
+// They are replayed only for paths the previous stream watched, so a newly added
+// path does not report changes from before it was watched.
+struct ReplayFilter {
+    until: fs::FSEventStreamEventId,
+    previous_watches: Arc<HashMap<PathBuf, WatchInfo>>,
 }
 
 impl fmt::Debug for FsEventWatcher {
@@ -363,8 +420,10 @@ fn translate_flags_with(flags: StreamFlags, precise: bool, mut emit: impl FnMut(
 
 struct StreamContextInfo {
     event_handler: Arc<Mutex<dyn EventHandler>>,
-    recursive_info: HashMap<PathBuf, WatchInfo>,
+    recursive_info: Arc<HashMap<PathBuf, WatchInfo>>,
     event_kinds: EventKindMask,
+    progress: Arc<Mutex<StreamProgress>>,
+    replay: Option<ReplayFilter>,
 }
 
 // Free the context when the stream created by `FSEventStreamCreate` is released.
@@ -461,14 +520,18 @@ impl FsEventWatcher {
     // set. The new stream is started before the old one is stopped, so that a
     // stream is watching at every moment: events firing inside a stop-then-start
     // window would be silently dropped for every watched path, not just the one
-    // being (un)watched. An event can be delivered through both streams during
-    // the swap; duplicates are fine, losses are not. Resuming the new stream
-    // from an older event id was tried and made things worse: historical replay
-    // stalls live delivery. If the new stream fails to start, the old one is
-    // kept running so the previous path set keeps delivering events.
+    // being (un)watched. That alone still drops the events the old stream holds
+    // back for `latency` (and any delivery its runloop has not run yet) when it
+    // is stopped, so while the old stream has such events outstanding the new
+    // one resumes from the last event id the old one delivered (see
+    // `replay_since`); an idle old stream is replaced from "now", because
+    // replaying a long stretch of history stalls live delivery. An event can be
+    // delivered through both streams during the swap; duplicates are fine,
+    // losses are not. If the new stream fails to start, the old one is kept
+    // running so the previous path set keeps delivering events.
     fn restart(&mut self) -> Result<()> {
         let old_runloop = self.runloop.take();
-        let result = self.run();
+        let result = self.run(old_runloop.as_ref());
         match &result {
             Ok(()) => {
                 if let Some(handle) = old_runloop {
@@ -498,6 +561,7 @@ impl FsEventWatcher {
             runloop,
             stop_source,
             thread_handle,
+            ..
         } = handle;
         {
             // Calling `CFRunLoopStop` directly here would race: it only takes effect
@@ -583,7 +647,7 @@ impl FsEventWatcher {
         paths
     }
 
-    fn run(&mut self) -> Result<()> {
+    fn run(&mut self, previous: Option<&RunLoopHandle>) -> Result<()> {
         let stream_paths = self.stream_paths();
         if stream_paths.is_empty() {
             return Ok(());
@@ -612,14 +676,48 @@ impl FsEventWatcher {
         // to the rest of the system. This will be owned by the stream, and will be freed when the
         // stream is closed. This means we will leak the context if we panic before reaching
         // `FSEventStreamRelease`.
-        let context = Box::into_raw(Box::new(StreamContextInfo {
-            event_handler: self.event_handler.clone(),
-            recursive_info: self
-                .watches
+        let recursive_info: Arc<HashMap<PathBuf, WatchInfo>> = Arc::new(
+            self.watches
                 .iter()
                 .map(|(path, entry)| (path.clone(), entry.info.clone()))
                 .collect(),
+        );
+
+        let latency = Duration::try_from_secs_f64(self.latency).unwrap_or(Duration::ZERO);
+        let resume = previous.and_then(|previous| {
+            let progress = *lock_ignoring_poison(&previous.progress);
+            let since_when = replay_since(progress, Instant::now(), latency)?;
+            Some((since_when, &previous.recursive_info))
+        });
+        let (since_when, replay) = match resume {
+            Some((since_when, previous_watches)) => (
+                since_when,
+                Some(ReplayFilter {
+                    until: unsafe { fs::FSEventsGetCurrentEventId() },
+                    previous_watches: previous_watches.clone(),
+                }),
+            ),
+            None => (self.since_when, None),
+        };
+        // Sampled before the stream is created, so every event the stream will
+        // deliver has a larger id.
+        let starting_event_id = if since_when == fs::kFSEventStreamEventIdSinceNow {
+            unsafe { fs::FSEventsGetCurrentEventId() }
+        } else {
+            since_when
+        };
+        let progress = Arc::new(Mutex::new(StreamProgress {
+            event_id: starting_event_id,
+            updated_at: Instant::now(),
+            history_pending: replay.is_some(),
+        }));
+
+        let context = Box::into_raw(Box::new(StreamContextInfo {
+            event_handler: self.event_handler.clone(),
+            recursive_info: recursive_info.clone(),
             event_kinds: self.event_kinds,
+            progress: progress.clone(),
+            replay,
         }));
 
         let stream_context = fs::FSEventStreamContext {
@@ -636,7 +734,7 @@ impl FsEventWatcher {
                 Some(callback),
                 &stream_context as *const _ as *mut _,
                 stream_paths.as_opaque(),
-                self.since_when,
+                since_when,
                 self.latency,
                 self.flags,
             )
@@ -759,6 +857,8 @@ impl FsEventWatcher {
             runloop: runloop_wrapper.0,
             stop_source: runloop_wrapper.1,
             thread_handle,
+            progress,
+            recursive_info,
         });
 
         Ok(())
@@ -812,13 +912,16 @@ unsafe fn callback_impl(
     num_events: libc::size_t,                          // size_t numEvents
     event_paths: NonNull<libc::c_void>,                // void *eventPaths
     event_flags: NonNull<fs::FSEventStreamEventFlags>, // const FSEventStreamEventFlags eventFlags[]
-    _event_ids: NonNull<fs::FSEventStreamEventId>,     // const FSEventStreamEventId eventIds[]
+    event_ids: NonNull<fs::FSEventStreamEventId>,      // const FSEventStreamEventId eventIds[]
 ) {
     let event_paths = event_paths.as_ptr() as *const *const libc::c_char;
     let info = info as *const StreamContextInfo;
     let event_handler_mutex = &(*info).event_handler;
     let event_kinds = (*info).event_kinds;
+    let replay = unsafe { (*info).replay.as_ref() };
     let mut event_handler_guard = None;
+    let mut latest_event_id = None;
+    let mut history_done = false;
 
     for p in 0..num_events {
         // Paths are not guaranteed to be valid UTF-8 (e.g. NFS); keep them as raw bytes.
@@ -833,31 +936,23 @@ unsafe fn callback_impl(
             log::trace!("unknown FSEventStreamEventFlags bits: 0x{unknown_bits:08x}");
         }
 
-        let mut watch_match = None;
-        for (watch_path, watch_info) in &(*info).recursive_info {
-            if path.starts_with(watch_path) {
-                let matches_watch = if watch_info.is_recursive || path == watch_path {
-                    true
-                } else if let Some(parent_path) = path.parent() {
-                    parent_path == watch_path
-                } else {
-                    false
-                };
+        let event_id = unsafe { *event_ids.as_ptr().add(p) };
+        // The sentinel only marks the end of a replay; its id is not an event's.
+        if flag.contains(StreamFlags::HISTORY_DONE) {
+            history_done = true;
+            continue;
+        }
+        latest_event_id = Some(event_id);
 
-                if matches_watch
-                    && watch_match.as_ref().is_none_or(
-                        |(matched_path, _): &(&PathBuf, &WatchInfo)| {
-                            watch_path.as_os_str().as_bytes().len()
-                                > matched_path.as_os_str().as_bytes().len()
-                        },
-                    )
-                {
-                    watch_match = Some((watch_path, watch_info));
-                }
-            }
+        if let Some(replay) = replay
+            && event_id <= replay.until
+            && find_watch(path, &replay.previous_watches).is_none()
+        {
+            continue;
         }
 
-        let Some((watch_path, watch_info)) = watch_match else {
+        let Some((watch_path, watch_info)) = find_watch(path, unsafe { &(*info).recursive_info })
+        else {
             continue;
         };
         let translated_count = translated_event_count(&flag, true);
@@ -901,6 +996,49 @@ unsafe fn callback_impl(
             });
         });
     }
+
+    // Recorded after the handler has run, so a replacement stream that reads it
+    // can only re-deliver, never skip, an event from this batch.
+    if latest_event_id.is_some() || history_done {
+        let mut progress = lock_ignoring_poison(unsafe { &(*info).progress });
+        if let Some(event_id) = latest_event_id {
+            progress.event_id = event_id;
+            progress.updated_at = Instant::now();
+        }
+        if history_done {
+            progress.history_pending = false;
+        }
+    }
+}
+
+// The deepest watch that covers `path`: a recursive watch covers its whole
+// subtree, a non-recursive one only itself and its direct children.
+fn find_watch<'a>(
+    path: &Path,
+    watches: &'a HashMap<PathBuf, WatchInfo>,
+) -> Option<(&'a PathBuf, &'a WatchInfo)> {
+    let mut watch_match: Option<(&PathBuf, &WatchInfo)> = None;
+    for (watch_path, watch_info) in watches {
+        if path.starts_with(watch_path) {
+            let matches_watch = if watch_info.is_recursive || path == watch_path {
+                true
+            } else if let Some(parent_path) = path.parent() {
+                parent_path == watch_path
+            } else {
+                false
+            };
+
+            if matches_watch
+                && watch_match.is_none_or(|(matched_path, _)| {
+                    watch_path.as_os_str().as_bytes().len()
+                        > matched_path.as_os_str().as_bytes().len()
+                })
+            {
+                watch_match = Some((watch_path, watch_info));
+            }
+        }
+    }
+    watch_match
 }
 
 impl Watcher for FsEventWatcher {
@@ -1115,6 +1253,37 @@ mod tests {
         std::fs::File::create_new(&path).expect("create");
 
         rx.wait_unordered([expected(path).create_file()]);
+    }
+
+    // With `NoDefer`, the first event after a quiet period is delivered at once
+    // and the next is held for the latency; watching another path in that
+    // window replaces the stream, which must not drop the held event.
+    #[test]
+    fn event_held_for_latency_survives_a_stream_swap() {
+        let tmpdir = testdir();
+        let watched = tmpdir.path().join("watched");
+        let added = tmpdir.path().join("added");
+        std::fs::create_dir(&watched).expect("create watched");
+        std::fs::create_dir(&added).expect("create added");
+
+        let (mut watcher, mut rx) = channel_with_config::<FsEventWatcher>(
+            ChannelConfig::default()
+                .with_timeout(Duration::from_secs(10))
+                .with_watcher_config(
+                    Config::default().with_fsevent_latency(Duration::from_secs(2)),
+                ),
+        );
+        watcher.watch_recursively(&watched);
+
+        let first = watched.join("first");
+        std::fs::File::create_new(&first).expect("create first");
+        rx.wait_unordered([expected(&first).create_file()]);
+
+        let held = watched.join("held");
+        std::fs::File::create_new(&held).expect("create held");
+        watcher.watch_recursively(&added);
+
+        rx.wait_unordered([expected(held).create_file()]);
     }
 
     #[test]
@@ -1361,36 +1530,57 @@ mod tests {
         recursive_info: HashMap<PathBuf, WatchInfo>,
         events: &[(&[u8], u32)],
     ) -> Vec<crate::Result<Event>> {
+        let events: Vec<_> = events
+            .iter()
+            .zip(0..)
+            .map(|(&(path, flags), event_id)| (path, flags, event_id))
+            .collect();
+        run_callback_with_ids(recursive_info, None, &events).0
+    }
+
+    /// Like `run_callback`, with explicit event ids and replay filter, also
+    /// returning the stream progress the callback recorded.
+    fn run_callback_with_ids(
+        recursive_info: HashMap<PathBuf, WatchInfo>,
+        replay: Option<ReplayFilter>,
+        events: &[(&[u8], u32, fs::FSEventStreamEventId)],
+    ) -> (Vec<crate::Result<Event>>, StreamProgress) {
         use std::ffi::CString;
         use std::ptr;
 
         let (tx, rx) = std::sync::mpsc::channel::<crate::Result<Event>>();
         let event_handler: Arc<Mutex<dyn EventHandler>> = Arc::new(Mutex::new(tx));
+        let progress = Arc::new(Mutex::new(StreamProgress {
+            event_id: 0,
+            updated_at: Instant::now(),
+            history_pending: replay.is_some(),
+        }));
 
         let context = Box::new(StreamContextInfo {
             event_handler,
-            recursive_info,
+            recursive_info: Arc::new(recursive_info),
             event_kinds: EventKindMask::ALL,
+            progress: progress.clone(),
+            replay,
         });
         let context_ptr = Box::into_raw(context) as *mut libc::c_void;
 
         let c_paths: Vec<CString> = events
             .iter()
-            .map(|(path, _)| CString::new(*path).expect("cstring"))
+            .map(|(path, _, _)| CString::new(*path).expect("cstring"))
             .collect();
         let path_ptrs: Vec<_> = c_paths.iter().map(|p| p.as_ptr()).collect();
         let event_paths = NonNull::new(path_ptrs.as_ptr() as *mut libc::c_void).unwrap();
 
         let flags_arr: Vec<fs::FSEventStreamEventFlags> = events
             .iter()
-            .map(|(_, flags)| *flags as fs::FSEventStreamEventFlags)
+            .map(|(_, flags, _)| *flags as fs::FSEventStreamEventFlags)
             .collect();
         let event_flags =
             NonNull::new(flags_arr.as_ptr() as *mut fs::FSEventStreamEventFlags).unwrap();
 
-        let ids_arr: Vec<fs::FSEventStreamEventId> = (0..events.len())
-            .map(|i| i as fs::FSEventStreamEventId)
-            .collect();
+        let ids_arr: Vec<fs::FSEventStreamEventId> =
+            events.iter().map(|(_, _, event_id)| *event_id).collect();
         let event_ids = NonNull::new(ids_arr.as_ptr() as *mut fs::FSEventStreamEventId).unwrap();
 
         let res = std::panic::catch_unwind(|| unsafe {
@@ -1408,7 +1598,95 @@ mod tests {
         }
         assert!(res.is_ok(), "callback_impl should not panic");
 
-        rx.try_iter().collect()
+        let progress = *lock_ignoring_poison(&progress);
+        (rx.try_iter().collect(), progress)
+    }
+
+    fn recursive_watch(path: &str) -> HashMap<PathBuf, WatchInfo> {
+        HashMap::from([(
+            PathBuf::from(path),
+            WatchInfo {
+                is_recursive: true,
+                reported_path: PathBuf::from(path),
+            },
+        )])
+    }
+
+    #[test]
+    fn replay_since_resumes_only_while_events_can_be_outstanding() {
+        let latency = Duration::from_millis(100);
+        let created = Instant::now();
+        let progress = StreamProgress {
+            event_id: 42,
+            updated_at: created,
+            history_pending: false,
+        };
+
+        assert_eq!(replay_since(progress, created, latency), Some(42));
+        assert_eq!(
+            replay_since(progress, created + latency + REPLAY_GRACE, latency),
+            Some(42)
+        );
+        let idle = created + latency + REPLAY_GRACE + Duration::from_millis(1);
+        assert_eq!(replay_since(progress, idle, latency), None);
+
+        let replaying = StreamProgress {
+            history_pending: true,
+            ..progress
+        };
+        assert_eq!(replay_since(replaying, idle, latency), Some(42));
+    }
+
+    #[test]
+    fn callback_records_the_last_event_id_but_not_the_history_done_sentinel() {
+        let (events, progress) = run_callback_with_ids(
+            recursive_watch("/tmp"),
+            None,
+            &[
+                (b"/tmp/a", StreamFlags::ITEM_CREATED.bits(), 10),
+                (b"/elsewhere/b", StreamFlags::ITEM_CREATED.bits(), 11),
+                (b"/tmp", StreamFlags::HISTORY_DONE.bits(), 99),
+            ],
+        );
+
+        assert_eq!(events.len(), 1, "unexpected events: {events:?}");
+        assert_eq!(progress.event_id, 11);
+        assert!(!progress.history_pending);
+    }
+
+    #[test]
+    fn replayed_events_are_limited_to_previously_watched_paths() {
+        let mut watches = recursive_watch("/old");
+        watches.extend(recursive_watch("/new"));
+        let replay = ReplayFilter {
+            until: 20,
+            previous_watches: Arc::new(recursive_watch("/old")),
+        };
+
+        let (events, progress) = run_callback_with_ids(
+            watches,
+            Some(replay),
+            &[
+                (b"/old/replayed", StreamFlags::ITEM_CREATED.bits(), 15),
+                (b"/new/before-watch", StreamFlags::ITEM_CREATED.bits(), 16),
+                (b"/old", StreamFlags::HISTORY_DONE.bits(), 20),
+                (b"/new/after-watch", StreamFlags::ITEM_CREATED.bits(), 21),
+            ],
+        );
+
+        let paths: Vec<_> = events
+            .into_iter()
+            .map(|event| event.expect("event").paths)
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                vec![PathBuf::from("/old/replayed")],
+                vec![PathBuf::from("/new/after-watch")],
+            ]
+        );
+        assert_eq!(progress.event_id, 21);
+        assert!(!progress.history_pending);
     }
 
     #[test]
