@@ -915,11 +915,28 @@ impl EventLoop {
         if !dereference {
             add_mask.insert(WatchMask::DONT_FOLLOW);
         }
+        // the kernel then refuses a path that stopped being a directory since the caller's
+        // stat, so a recorded `is_dir` of true always holds for the inode actually watched
+        if is_dir {
+            add_mask.insert(WatchMask::ONLYDIR);
+        }
 
         if let Some(ref mut inotify) = self.inotify {
             log::trace!("adding inotify watch: {}", path.absolute.display());
 
             match inotify.watches().add(&path.absolute, add_mask) {
+                Err(e) if is_dir && e.raw_os_error() == Some(libc::ENOTDIR) => {
+                    let is_dir = watch_metadata(&path.absolute, dereference)
+                        .map_err(|e| Error::io_watch(e).add_path(path.requested.clone()))?
+                        .is_dir();
+                    self.add_single_watch(
+                        path,
+                        is_recursive,
+                        requested_dereference,
+                        watch_self,
+                        is_dir,
+                    )
+                }
                 Err(e) => {
                     Err(if e.raw_os_error() == Some(libc::ENOSPC) {
                         // do not report inotify limits as "no more space" on linux #266
@@ -933,6 +950,21 @@ impl EventLoop {
                 }
                 Ok(w) => {
                     debug_assert!(!watchmask.intersects(RESOLUTION_FLAGS));
+                    // inotify has no inverse of ONLYDIR, so a path the caller saw as a file
+                    // is checked again in case a directory replaced it before the add
+                    let is_dir = if is_dir {
+                        true
+                    } else {
+                        match watch_metadata(&path.absolute, dereference) {
+                            Ok(metadata) => metadata.is_dir(),
+                            Err(e) => {
+                                // Avoid leaking an inotify watch if we can't stat after adding it.
+                                // This can happen due to racy deletions.
+                                let _ = inotify.watches().remove(w.clone());
+                                return Err(Error::io_watch(e).add_path(path.requested));
+                            }
+                        }
+                    };
                     let metadata = if let Some(existing_watch) = existing_watch {
                         WatchMetadata::new(
                             &path,
@@ -2674,6 +2706,34 @@ mod tests {
         assert!(!event_loop.watches.get(&directory_link).unwrap().is_dir);
         assert!(event_loop.watches.get(&directory).unwrap().is_dir);
         assert!(event_loop.watches.get(&nested).unwrap().is_dir);
+    }
+
+    #[test]
+    fn a_directory_replaced_by_a_file_before_the_add_is_recorded_as_a_file() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("replaced");
+        std::fs::write(&path, b"").unwrap();
+
+        let mut event_loop = test_event_loop();
+        event_loop
+            .add_single_watch(WatchPath::new(&path).unwrap(), false, true, true, true)
+            .unwrap();
+
+        assert!(!event_loop.watches.get(&path).unwrap().is_dir);
+    }
+
+    #[test]
+    fn a_file_replaced_by_a_directory_before_the_add_is_recorded_as_a_directory() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("replaced");
+        std::fs::create_dir(&path).unwrap();
+
+        let mut event_loop = test_event_loop();
+        event_loop
+            .add_single_watch(WatchPath::new(&path).unwrap(), false, true, true, false)
+            .unwrap();
+
+        assert!(event_loop.watches.get(&path).unwrap().is_dir);
     }
 
     #[test]
