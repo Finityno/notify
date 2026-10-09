@@ -138,21 +138,29 @@ struct RunLoopHandle {
     progress: Arc<StreamProgress>,
 }
 
-// Flush requests from `restart` and their completions by the flush source's
-// perform on the stream's runloop thread; `restart` waits on it before stopping
-// the stream.
+// Flush requests from `restart`, the flush source's answers to them, and what
+// the stream's callback has handed to the event handler; `restart` waits on it
+// before stopping the stream.
 #[derive(Debug, Default)]
 struct StreamProgress {
     state: Mutex<FlushState>,
     changed: Condvar,
 }
 
-// Completion is tracked by request generation, not by event id: `RootChanged`
-// events carry id 0, so no id comparison can tell whether one is still pending.
+// A flush is complete once the flush source has answered it and the callback
+// has handed the event handler every event the service had queued for the
+// stream when it was asked. That is decided by the ids the callback has seen,
+// not by `FSEventStreamFlushSync` returning: with it, an event held for the
+// latency was lost under parallel FSEvents load, because the stream was stopped
+// before that event had reached the callback. A held zero-id `RootChanged`
+// event alone cannot be waited for this way. The generation keeps a flush
+// answered before a request was made from satisfying it.
 #[derive(Debug, Default)]
 struct FlushState {
     requested: u64,
-    completed: u64,
+    answered: u64,
+    flush_target: fs::FSEventStreamEventId,
+    delivered: fs::FSEventStreamEventId,
 }
 
 impl FlushState {
@@ -162,17 +170,24 @@ impl FlushState {
     }
 
     // Taken before the flush starts, so a request made while it runs is not
-    // reported complete by it.
+    // reported answered by it.
     fn pending(&self) -> u64 {
         self.requested
     }
 
-    fn complete(&mut self, generation: u64) {
-        self.completed = self.completed.max(generation);
+    // `queued` is what `FSEventStreamFlushAsync` returned: the largest id ever
+    // queued for the stream, or 0 if none was.
+    fn answer(&mut self, generation: u64, queued: fs::FSEventStreamEventId) {
+        self.answered = self.answered.max(generation);
+        self.flush_target = self.flush_target.max(queued);
+    }
+
+    fn record_delivery(&mut self, highest_id: fs::FSEventStreamEventId) {
+        self.delivered = self.delivered.max(highest_id);
     }
 
     fn is_complete(&self, generation: u64) -> bool {
-        self.completed >= generation
+        self.answered >= generation && self.delivered >= self.flush_target
     }
 }
 
@@ -418,6 +433,7 @@ struct StreamContextInfo {
     event_handler: Arc<Mutex<dyn EventHandler>>,
     recursive_info: HashMap<PathBuf, WatchInfo>,
     event_kinds: EventKindMask,
+    progress: Arc<StreamProgress>,
 }
 
 // Free the context when the stream created by `FSEventStreamCreate` is released.
@@ -451,17 +467,16 @@ struct FlushSourceInfo {
 }
 
 // Runs on the watcher thread, the thread the stream is scheduled on, so the
-// stream is only ever touched there. `FSEventStreamFlushSync` hands everything
-// the stream holds back for `latency`, or has received but not yet delivered, to
-// the callback before it returns; the callback runs nested here, on the same
-// thread as every other delivery. No lock is held across it: the callback takes
-// only the event handler's mutex, and `flush_handle` takes `progress.state` only
-// briefly.
+// stream is only ever touched there. `FSEventStreamFlushAsync` asks the service
+// to send everything it holds back for `latency`; those events then reach the
+// callback through this runloop like any other delivery, after this perform
+// returns. No lock is held across the call, because the callback takes
+// `progress.state` too.
 unsafe extern "C-unwind" fn flush_stream_perform(info: *mut std::ffi::c_void) {
     let info = unsafe { &*(info as *const FlushSourceInfo) };
     let generation = lock_ignoring_poison(&info.progress.state).pending();
-    unsafe { fs::FSEventStreamFlushSync(info.stream) };
-    lock_ignoring_poison(&info.progress.state).complete(generation);
+    let queued = unsafe { fs::FSEventStreamFlushAsync(info.stream) };
+    lock_ignoring_poison(&info.progress.state).answer(generation, queued);
     info.progress.changed.notify_all();
 }
 
@@ -732,6 +747,8 @@ impl FsEventWatcher {
                 }
             };
 
+        let progress = Arc::new(StreamProgress::default());
+
         // We need to associate the stream context with our callback in order to propagate events
         // to the rest of the system. This will be owned by the stream, and will be freed when the
         // stream is closed. This means we will leak the context if we panic before reaching
@@ -744,6 +761,7 @@ impl FsEventWatcher {
                 .map(|(path, entry)| (path.clone(), entry.info.clone()))
                 .collect(),
             event_kinds: self.event_kinds,
+            progress: progress.clone(),
         }));
 
         let stream_context = fs::FSEventStreamContext {
@@ -792,7 +810,6 @@ impl FsEventWatcher {
         // channel to pass runloop around
         let (rl_tx, rl_rx) = unbounded();
 
-        let progress = Arc::new(StreamProgress::default());
         let flush_progress = progress.clone();
         let thread_handle = thread::Builder::new()
             .name("notify-rs fsevents loop".to_string())
@@ -974,7 +991,7 @@ unsafe fn callback_impl(
     num_events: libc::size_t,                          // size_t numEvents
     event_paths: NonNull<libc::c_void>,                // void *eventPaths
     event_flags: NonNull<fs::FSEventStreamEventFlags>, // const FSEventStreamEventFlags eventFlags[]
-    _event_ids: NonNull<fs::FSEventStreamEventId>,     // const FSEventStreamEventId eventIds[]
+    event_ids: NonNull<fs::FSEventStreamEventId>,      // const FSEventStreamEventId eventIds[]
 ) {
     let event_paths = event_paths.as_ptr() as *const *const libc::c_char;
     let info = info as *const StreamContextInfo;
@@ -1039,6 +1056,17 @@ unsafe fn callback_impl(
                 log::error!("panic in FSEvents event handler; dropping event");
             });
         });
+    }
+
+    // Recorded only once the handler is through the whole batch, and after its
+    // lock is released, so a waiting `flush_handle` never sees a delivery that
+    // is still in progress.
+    drop(event_handler_guard);
+    let event_ids = unsafe { std::slice::from_raw_parts(event_ids.as_ptr(), num_events) };
+    if let Some(highest_id) = event_ids.iter().copied().max() {
+        let progress = unsafe { &(*info).progress };
+        lock_ignoring_poison(&progress.state).record_delivery(highest_id);
+        progress.changed.notify_all();
     }
 }
 
@@ -1288,9 +1316,18 @@ mod tests {
 
     // With `NoDefer`, the first event after a quiet period is delivered at once
     // and the next is held for the latency; watching another path in that
-    // window replaces the stream, which must not drop the held event.
+    // window replaces the stream, which must not drop the held event. The test
+    // first waits a part of the latency and checks the event really is held:
+    // by then the service has queued it for the old stream, so the new stream,
+    // which starts from now, cannot deliver it, and only the old stream's flush
+    // can. Only events on its own path count, so other tests' FSEvents traffic
+    // cannot satisfy or fail it.
     #[test]
     fn event_held_for_latency_survives_a_stream_swap() {
+        const LATENCY: Duration = Duration::from_secs(3);
+        const HELD_CHECK: Duration = Duration::from_secs(1);
+        const LATE_ARRIVAL_WAIT: Duration = Duration::from_secs(10);
+
         let tmpdir = testdir();
         let watched = tmpdir.path().join("watched");
         let added = tmpdir.path().join("added");
@@ -1300,9 +1337,7 @@ mod tests {
         let (mut watcher, mut rx) = channel_with_config::<FsEventWatcher>(
             ChannelConfig::default()
                 .with_timeout(Duration::from_secs(10))
-                .with_watcher_config(
-                    Config::default().with_fsevent_latency(Duration::from_secs(2)),
-                ),
+                .with_watcher_config(Config::default().with_fsevent_latency(LATENCY)),
         );
         watcher.watch_recursively(&watched);
 
@@ -1311,10 +1346,60 @@ mod tests {
         rx.wait_unordered([expected(&first).create_file()]);
 
         let held = watched.join("held");
+        let is_held_creation = |event: &Event| expected(&held).create_file() == *event;
         std::fs::File::create_new(&held).expect("create held");
-        watcher.watch_recursively(&added);
+        let held_created = Instant::now();
 
-        rx.wait_unordered([expected(held).create_file()]);
+        let check_ends = held_created + HELD_CHECK;
+        loop {
+            let remaining = check_ends.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.rx.recv_timeout(remaining) {
+                Ok(Ok(event)) => assert!(
+                    !is_held_creation(&event),
+                    "the event was delivered {:?} after it happened, inside the {LATENCY:?} \
+                     latency, so it was never held and the swap below proves nothing",
+                    held_created.elapsed()
+                ),
+                Ok(Err(error)) => panic!("watcher error before the swap: {error:?}"),
+                Err(_) => break,
+            }
+        }
+
+        let swap_started = Instant::now();
+        watcher.watch_recursively(&added);
+        let swap_took = swap_started.elapsed();
+
+        // The swap waits for the old stream's flushed events to pass through the
+        // handler, so the held event must be in the channel when it returns.
+        let delivered_by_swap = rx
+            .rx
+            .try_iter()
+            .any(|result| result.is_ok_and(|event| is_held_creation(&event)));
+        if delivered_by_swap {
+            return;
+        }
+
+        let late_arrival_ends = Instant::now() + LATE_ARRIVAL_WAIT;
+        loop {
+            let remaining = late_arrival_ends.saturating_duration_since(Instant::now());
+            match rx.rx.recv_timeout(remaining) {
+                Ok(Ok(event)) if is_held_creation(&event) => panic!(
+                    "the held event arrived {:?} after it happened, after the swap returned \
+                     (the swap took {swap_took:?}): the old stream was not flushed before it \
+                     was stopped",
+                    held_created.elapsed()
+                ),
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("watcher error after the swap: {error:?}"),
+                Err(_) => panic!(
+                    "the held event was lost: nothing for it {LATE_ARRIVAL_WAIT:?} after a swap \
+                     that took {swap_took:?}"
+                ),
+            }
+        }
     }
 
     #[test]
@@ -1561,6 +1646,14 @@ mod tests {
         recursive_info: HashMap<PathBuf, WatchInfo>,
         events: &[(&[u8], u32)],
     ) -> Vec<crate::Result<Event>> {
+        run_callback_with_progress(recursive_info, events, Arc::default())
+    }
+
+    fn run_callback_with_progress(
+        recursive_info: HashMap<PathBuf, WatchInfo>,
+        events: &[(&[u8], u32)],
+        progress: Arc<StreamProgress>,
+    ) -> Vec<crate::Result<Event>> {
         use std::ffi::CString;
         use std::ptr;
 
@@ -1571,6 +1664,7 @@ mod tests {
             event_handler,
             recursive_info,
             event_kinds: EventKindMask::ALL,
+            progress,
         });
         let context_ptr = Box::into_raw(context) as *mut libc::c_void;
 
@@ -1622,16 +1716,16 @@ mod tests {
         // generation before that request, so it must not complete it.
         let running = state.pending();
         let second = state.request();
-        state.complete(running);
+        state.answer(running, 0);
         assert!(state.is_complete(first));
         assert!(!state.is_complete(second));
 
         let next = state.pending();
-        state.complete(next);
+        state.answer(next, 0);
         assert!(state.is_complete(second));
 
-        // A late completion from an older flush never moves the counter back.
-        state.complete(running);
+        // A late answer from an older flush never moves the counter back.
+        state.answer(running, 0);
         assert!(state.is_complete(second));
     }
 
@@ -1644,9 +1738,64 @@ mod tests {
         let second = state.request();
 
         let generation = state.pending();
-        state.complete(generation);
+        state.answer(generation, 0);
         assert!(state.is_complete(first));
         assert!(state.is_complete(second));
+    }
+
+    // An answered flush is not complete until the callback has handed over
+    // the last event the service had queued, which is how an event held for
+    // the latency gets through before the stream is stopped.
+    #[test]
+    fn flush_waits_for_the_queued_events_to_be_delivered() {
+        let mut state = FlushState::default();
+        state.record_delivery(10);
+
+        let generation = state.request();
+        state.answer(state.pending(), 12);
+        assert!(!state.is_complete(generation), "event 12 is still held");
+
+        state.record_delivery(11);
+        assert!(!state.is_complete(generation), "event 12 is still held");
+
+        // Zero-id events such as `RootChanged` never move delivery back.
+        state.record_delivery(0);
+        state.record_delivery(12);
+        assert!(state.is_complete(generation));
+    }
+
+    #[test]
+    fn flush_with_nothing_queued_completes_once_answered() {
+        let mut state = FlushState::default();
+        let generation = state.request();
+        assert!(!state.is_complete(generation));
+        state.answer(state.pending(), 0);
+        assert!(state.is_complete(generation));
+    }
+
+    #[test]
+    fn callback_records_the_highest_delivered_id() {
+        let mut recursive_info = HashMap::new();
+        recursive_info.insert(
+            PathBuf::from("/watched"),
+            WatchInfo {
+                is_recursive: true,
+                reported_path: PathBuf::from("/watched"),
+            },
+        );
+        let progress = Arc::new(StreamProgress::default());
+        // The unwatched path still counts: the service delivered it, so a
+        // flush must not wait for it again.
+        let events = run_callback_with_progress(
+            recursive_info,
+            &[
+                (b"/watched/a".as_slice(), StreamFlags::ITEM_CREATED.bits()),
+                (b"/elsewhere/b".as_slice(), StreamFlags::ITEM_CREATED.bits()),
+            ],
+            progress.clone(),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(lock_ignoring_poison(&progress.state).delivered, 1);
     }
 
     #[test]
