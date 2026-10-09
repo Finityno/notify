@@ -138,41 +138,48 @@ struct RunLoopHandle {
     progress: Arc<StreamProgress>,
 }
 
-// How far a stream's callback has got, shared between the callback (on the
-// stream's runloop thread), the flush source's perform (same thread) and
-// `restart`, which waits on it before stopping the stream.
+// Flush requests from `restart` and their completions by the flush source's
+// perform on the stream's runloop thread; `restart` waits on it before stopping
+// the stream.
 #[derive(Debug, Default)]
 struct StreamProgress {
     state: Mutex<FlushState>,
     changed: Condvar,
 }
 
+// Completion is tracked by request generation, not by event id: `RootChanged`
+// events carry id 0, so no id comparison can tell whether one is still pending.
 #[derive(Debug, Default)]
 struct FlushState {
-    // The largest event id whose batch the callback has finished handling.
-    // Only ever moves forward: some events (`RootChanged`) carry id 0, and a
-    // flush is complete once this reaches the flush target.
-    handled_event_id: fs::FSEventStreamEventId,
-    // What `FSEventStreamFlushAsync` returned for the pending flush request: the
-    // largest id ever queued for the stream, 0 if none.
-    flush_target: Option<fs::FSEventStreamEventId>,
+    requested: u64,
+    completed: u64,
 }
 
 impl FlushState {
-    fn record_handled(&mut self, event_id: fs::FSEventStreamEventId) {
-        self.handled_event_id = self.handled_event_id.max(event_id);
+    fn request(&mut self) -> u64 {
+        self.requested += 1;
+        self.requested
     }
 
-    fn flushed(&self) -> bool {
-        self.flush_target
-            .is_some_and(|target| self.handled_event_id >= target)
+    // Taken before the flush starts, so a request made while it runs is not
+    // reported complete by it.
+    fn pending(&self) -> u64 {
+        self.requested
+    }
+
+    fn complete(&mut self, generation: u64) {
+        self.completed = self.completed.max(generation);
+    }
+
+    fn is_complete(&self, generation: u64) -> bool {
+        self.completed >= generation
     }
 }
 
 // Bounds how long a swap waits for the old stream's flushed events to pass
-// through the event handler, on top of the stream latency. Hitting it means the
-// handler or fseventsd is wedged; the swap then goes ahead without the guarantee
-// rather than hanging the watch call.
+// through the event handler. Hitting it means the handler or fseventsd is
+// wedged; the swap then goes ahead without the guarantee rather than hanging the
+// watch call.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -411,7 +418,6 @@ struct StreamContextInfo {
     event_handler: Arc<Mutex<dyn EventHandler>>,
     recursive_info: HashMap<PathBuf, WatchInfo>,
     event_kinds: EventKindMask,
-    progress: Arc<StreamProgress>,
 }
 
 // Free the context when the stream created by `FSEventStreamCreate` is released.
@@ -444,14 +450,18 @@ struct FlushSourceInfo {
     progress: Arc<StreamProgress>,
 }
 
-// Runs on the watcher thread, so the stream is only ever touched from the thread
-// it is scheduled on. `FSEventStreamFlushAsync` sends whatever the stream holds
-// back for `latency` right away and returns the largest id it has queued; the
-// callback then reaches that id on this same runloop, after this returns.
+// Runs on the watcher thread, the thread the stream is scheduled on, so the
+// stream is only ever touched there. `FSEventStreamFlushSync` hands everything
+// the stream holds back for `latency`, or has received but not yet delivered, to
+// the callback before it returns; the callback runs nested here, on the same
+// thread as every other delivery. No lock is held across it: the callback takes
+// only the event handler's mutex, and `flush_handle` takes `progress.state` only
+// briefly.
 unsafe extern "C-unwind" fn flush_stream_perform(info: *mut std::ffi::c_void) {
     let info = unsafe { &*(info as *const FlushSourceInfo) };
-    let target = unsafe { fs::FSEventStreamFlushAsync(info.stream) };
-    lock_ignoring_poison(&info.progress.state).flush_target = Some(target);
+    let generation = lock_ignoring_poison(&info.progress.state).pending();
+    unsafe { fs::FSEventStreamFlushSync(info.stream) };
+    lock_ignoring_poison(&info.progress.state).complete(generation);
     info.progress.changed.notify_all();
 }
 
@@ -544,15 +554,10 @@ impl FsEventWatcher {
                 if let Some(handle) = old_runloop {
                     // With no replacement stream there is nobody to hand over to,
                     // and the remaining paths were all unwatched.
-                    if self.runloop.is_some() {
-                        let timeout = Duration::try_from_secs_f64(self.latency)
-                            .unwrap_or(Duration::ZERO)
-                            .saturating_add(FLUSH_TIMEOUT);
-                        if !Self::flush_handle(&handle, timeout) {
-                            log::warn!(
-                                "FSEvents stream did not flush within {timeout:?}; events it held back may be lost"
-                            );
-                        }
+                    if self.runloop.is_some() && !Self::flush_handle(&handle, FLUSH_TIMEOUT) {
+                        log::warn!(
+                            "FSEvents stream did not flush within {FLUSH_TIMEOUT:?}; events it held back may be lost"
+                        );
                     }
                     Self::stop_handle(handle);
                 }
@@ -575,9 +580,9 @@ impl FsEventWatcher {
         }
     }
 
-    // Has the old stream hand everything it has queued to the event handler, and
-    // waits until the handler is through it. Returns false if that did not
-    // happen within `timeout`.
+    // Has the old stream hand everything it holds to the event handler, and waits
+    // until the handler is through it. Returns false if that did not happen
+    // within `timeout`.
     //
     // The stream is flushed on its own runloop thread, which is alive until
     // `stop_handle` signals it, so the request cannot be lost. Only the caller of
@@ -588,19 +593,16 @@ impl FsEventWatcher {
         if handle.thread_handle.thread().id() == thread::current().id() {
             return false;
         }
-        // A latency large enough to overflow `Instant` waits without a deadline
-        // rather than panicking.
-        let deadline = Instant::now().checked_add(timeout);
-        lock_ignoring_poison(&handle.progress.state).flush_target = None;
+        let deadline = Instant::now() + timeout;
+        // Requested before signalling, so a completion of an earlier flush cannot
+        // satisfy this one.
+        let generation = lock_ignoring_poison(&handle.progress.state).request();
         handle.flush_source.signal();
         handle.runloop.wake_up();
 
         let mut state = lock_ignoring_poison(&handle.progress.state);
-        while !state.flushed() {
-            let remaining = match deadline {
-                Some(deadline) => deadline.saturating_duration_since(Instant::now()),
-                None => timeout,
-            };
+        while !state.is_complete(generation) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return false;
             }
@@ -734,7 +736,6 @@ impl FsEventWatcher {
         // to the rest of the system. This will be owned by the stream, and will be freed when the
         // stream is closed. This means we will leak the context if we panic before reaching
         // `FSEventStreamRelease`.
-        let progress = Arc::new(StreamProgress::default());
         let context = Box::into_raw(Box::new(StreamContextInfo {
             event_handler: self.event_handler.clone(),
             recursive_info: self
@@ -743,7 +744,6 @@ impl FsEventWatcher {
                 .map(|(path, entry)| (path.clone(), entry.info.clone()))
                 .collect(),
             event_kinds: self.event_kinds,
-            progress: progress.clone(),
         }));
 
         let stream_context = fs::FSEventStreamContext {
@@ -792,6 +792,7 @@ impl FsEventWatcher {
         // channel to pass runloop around
         let (rl_tx, rl_rx) = unbounded();
 
+        let progress = Arc::new(StreamProgress::default());
         let flush_progress = progress.clone();
         let thread_handle = thread::Builder::new()
             .name("notify-rs fsevents loop".to_string())
@@ -973,14 +974,13 @@ unsafe fn callback_impl(
     num_events: libc::size_t,                          // size_t numEvents
     event_paths: NonNull<libc::c_void>,                // void *eventPaths
     event_flags: NonNull<fs::FSEventStreamEventFlags>, // const FSEventStreamEventFlags eventFlags[]
-    event_ids: NonNull<fs::FSEventStreamEventId>,      // const FSEventStreamEventId eventIds[]
+    _event_ids: NonNull<fs::FSEventStreamEventId>,     // const FSEventStreamEventId eventIds[]
 ) {
     let event_paths = event_paths.as_ptr() as *const *const libc::c_char;
     let info = info as *const StreamContextInfo;
     let event_handler_mutex = &(*info).event_handler;
     let event_kinds = (*info).event_kinds;
     let mut event_handler_guard = None;
-    let mut handled_event_id: fs::FSEventStreamEventId = 0;
 
     for p in 0..num_events {
         // Paths are not guaranteed to be valid UTF-8 (e.g. NFS); keep them as raw bytes.
@@ -994,9 +994,6 @@ unsafe fn callback_impl(
             // `FSEventStreamEventFlags` is an extensible bitfield; tolerate future flags.
             log::trace!("unknown FSEventStreamEventFlags bits: 0x{unknown_bits:08x}");
         }
-
-        // Ids are not monotonic within a batch: `RootChanged` events carry 0.
-        handled_event_id = handled_event_id.max(unsafe { *event_ids.as_ptr().add(p) });
 
         let Some((watch_path, watch_info)) = find_watch(path, unsafe { &(*info).recursive_info })
         else {
@@ -1042,14 +1039,6 @@ unsafe fn callback_impl(
                 log::error!("panic in FSEvents event handler; dropping event");
             });
         });
-    }
-
-    // Recorded after the handler has run, so a swap waiting for a flush only
-    // stops this stream once the flushed events are through the handler.
-    if handled_event_id != 0 {
-        let progress = unsafe { &(*info).progress };
-        lock_ignoring_poison(&progress.state).record_handled(handled_event_id);
-        progress.changed.notify_all();
     }
 }
 
@@ -1572,51 +1561,36 @@ mod tests {
         recursive_info: HashMap<PathBuf, WatchInfo>,
         events: &[(&[u8], u32)],
     ) -> Vec<crate::Result<Event>> {
-        let events: Vec<_> = events
-            .iter()
-            .zip(0..)
-            .map(|(&(path, flags), event_id)| (path, flags, event_id))
-            .collect();
-        run_callback_with_ids(recursive_info, &events).0
-    }
-
-    /// Like `run_callback`, with explicit event ids, also returning the handled
-    /// event id the callback recorded.
-    fn run_callback_with_ids(
-        recursive_info: HashMap<PathBuf, WatchInfo>,
-        events: &[(&[u8], u32, fs::FSEventStreamEventId)],
-    ) -> (Vec<crate::Result<Event>>, fs::FSEventStreamEventId) {
         use std::ffi::CString;
         use std::ptr;
 
         let (tx, rx) = std::sync::mpsc::channel::<crate::Result<Event>>();
         let event_handler: Arc<Mutex<dyn EventHandler>> = Arc::new(Mutex::new(tx));
-        let progress = Arc::new(StreamProgress::default());
 
         let context = Box::new(StreamContextInfo {
             event_handler,
             recursive_info,
             event_kinds: EventKindMask::ALL,
-            progress: progress.clone(),
         });
         let context_ptr = Box::into_raw(context) as *mut libc::c_void;
 
         let c_paths: Vec<CString> = events
             .iter()
-            .map(|(path, _, _)| CString::new(*path).expect("cstring"))
+            .map(|(path, _)| CString::new(*path).expect("cstring"))
             .collect();
         let path_ptrs: Vec<_> = c_paths.iter().map(|p| p.as_ptr()).collect();
         let event_paths = NonNull::new(path_ptrs.as_ptr() as *mut libc::c_void).unwrap();
 
         let flags_arr: Vec<fs::FSEventStreamEventFlags> = events
             .iter()
-            .map(|(_, flags, _)| *flags as fs::FSEventStreamEventFlags)
+            .map(|(_, flags)| *flags as fs::FSEventStreamEventFlags)
             .collect();
         let event_flags =
             NonNull::new(flags_arr.as_ptr() as *mut fs::FSEventStreamEventFlags).unwrap();
 
-        let ids_arr: Vec<fs::FSEventStreamEventId> =
-            events.iter().map(|(_, _, event_id)| *event_id).collect();
+        let ids_arr: Vec<fs::FSEventStreamEventId> = (0..events.len())
+            .map(|i| i as fs::FSEventStreamEventId)
+            .collect();
         let event_ids = NonNull::new(ids_arr.as_ptr() as *mut fs::FSEventStreamEventId).unwrap();
 
         let res = std::panic::catch_unwind(|| unsafe {
@@ -1634,76 +1608,45 @@ mod tests {
         }
         assert!(res.is_ok(), "callback_impl should not panic");
 
-        let handled_event_id = lock_ignoring_poison(&progress.state).handled_event_id;
-        (rx.try_iter().collect(), handled_event_id)
-    }
-
-    fn recursive_watch(path: &str) -> HashMap<PathBuf, WatchInfo> {
-        HashMap::from([(
-            PathBuf::from(path),
-            WatchInfo {
-                is_recursive: true,
-                reported_path: PathBuf::from(path),
-            },
-        )])
+        rx.try_iter().collect()
     }
 
     #[test]
-    fn flush_completes_once_the_handled_id_reaches_the_target() {
+    fn flush_waits_for_its_own_generation() {
         let mut state = FlushState::default();
-        assert!(!state.flushed(), "no flush requested yet");
 
-        state.flush_target = Some(0);
-        assert!(state.flushed(), "a stream that queued nothing is flushed");
+        let first = state.request();
+        assert!(!state.is_complete(first), "nothing has been flushed yet");
 
-        state.flush_target = Some(30);
-        state.record_handled(20);
-        assert!(!state.flushed());
-        state.record_handled(0);
-        state.record_handled(10);
-        assert_eq!(state.handled_event_id, 20, "the handled id never moves back");
-        state.record_handled(30);
-        assert!(state.flushed());
+        // A flush already running when the second request arrives took its
+        // generation before that request, so it must not complete it.
+        let running = state.pending();
+        let second = state.request();
+        state.complete(running);
+        assert!(state.is_complete(first));
+        assert!(!state.is_complete(second));
+
+        let next = state.pending();
+        state.complete(next);
+        assert!(state.is_complete(second));
+
+        // A late completion from an older flush never moves the counter back.
+        state.complete(running);
+        assert!(state.is_complete(second));
     }
 
-    // `RootChanged` events carry id 0 and batches need not be ordered; neither
-    // may move the recorded id back, and the events are still delivered.
+    // Signals to a runloop source coalesce, so one perform can answer several
+    // requests.
     #[test]
-    fn callback_records_the_largest_event_id_and_delivers_zero_id_events() {
-        let (events, handled_event_id) = run_callback_with_ids(
-            recursive_watch("/tmp"),
-            &[
-                (b"/tmp/a", StreamFlags::ITEM_CREATED.bits(), 10),
-                (b"/elsewhere/b", StreamFlags::ITEM_CREATED.bits(), 12),
-                (b"/tmp", StreamFlags::ROOT_CHANGED.bits(), 0),
-                (b"/tmp/c", StreamFlags::ITEM_CREATED.bits(), 11),
-            ],
-        );
+    fn one_flush_completes_every_request_made_before_it() {
+        let mut state = FlushState::default();
+        let first = state.request();
+        let second = state.request();
 
-        let paths: Vec<_> = events
-            .into_iter()
-            .map(|event| event.expect("event").paths)
-            .collect();
-        assert_eq!(
-            paths,
-            vec![
-                vec![PathBuf::from("/tmp/a")],
-                vec![PathBuf::from("/tmp")],
-                vec![PathBuf::from("/tmp/c")],
-            ]
-        );
-        assert_eq!(handled_event_id, 12);
-    }
-
-    #[test]
-    fn callback_with_only_zero_id_events_records_nothing() {
-        let (events, handled_event_id) = run_callback_with_ids(
-            recursive_watch("/tmp"),
-            &[(b"/tmp", StreamFlags::ROOT_CHANGED.bits(), 0)],
-        );
-
-        assert_eq!(events.len(), 1, "unexpected events: {events:?}");
-        assert_eq!(handled_event_id, 0);
+        let generation = state.pending();
+        state.complete(generation);
+        assert!(state.is_complete(first));
+        assert!(state.is_complete(second));
     }
 
     #[test]
