@@ -925,18 +925,10 @@ impl EventLoop {
             log::trace!("adding inotify watch: {}", path.absolute.display());
 
             match inotify.watches().add(&path.absolute, add_mask) {
-                Err(e) if is_dir && e.raw_os_error() == Some(libc::ENOTDIR) => {
-                    let is_dir = watch_metadata(&path.absolute, dereference)
-                        .map_err(|e| Error::io_watch(e).add_path(path.requested.clone()))?
-                        .is_dir();
-                    self.add_single_watch(
-                        path,
-                        is_recursive,
-                        requested_dereference,
-                        watch_self,
-                        is_dir,
-                    )
-                }
+                // retrying as a non-directory never takes this arm again, and its post-add
+                // stat records whatever type the path has by then
+                Err(e) if is_dir && e.raw_os_error() == Some(libc::ENOTDIR) => self
+                    .add_single_watch(path, is_recursive, requested_dereference, watch_self, false),
                 Err(e) => {
                     Err(if e.raw_os_error() == Some(libc::ENOSPC) {
                         // do not report inotify limits as "no more space" on linux #266
