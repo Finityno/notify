@@ -1046,36 +1046,59 @@ impl FsEventWatcher {
 
     // Runs once the old stream has stopped, so every `RootChanged` event it
     // delivered has already updated `root_identities`; see `RootIdentity`.
+    //
+    // The events go to the handler from a thread of their own, as stream events
+    // do: this runs inside `watch`/`unwatch`, and a handler that calls back into
+    // the watcher, or takes a lock its caller holds, would deadlock on the
+    // caller's thread.
     fn report_root_changes_held_by(&self, previous_roots: &[PathBuf]) {
+        let events = self.root_change_events(previous_roots);
+        if events.is_empty() {
+            return;
+        }
+        let event_handler = self.event_handler.clone();
+        let spawned = thread::Builder::new()
+            .name("notify-rs fsevents root changes".to_string())
+            .spawn(move || {
+                let mut event_handler = lock_ignoring_poison(&event_handler);
+                for event in events {
+                    event_handler.handle_event(Ok(event));
+                }
+            });
+        if let Err(error) = spawned {
+            log::warn!("could not report watched roots that changed during a stream swap: {error}");
+        }
+    }
+
+    fn root_change_events(&self, previous_roots: &[PathBuf]) -> Vec<Event> {
         let changed_roots = {
             let mut identities = lock_ignoring_poison(&self.root_identities);
             take_unreported_root_changes(previous_roots, &mut identities, RootIdentity::of)
         };
-        if changed_roots.is_empty() {
-            return;
-        }
-        let mut event_handler = lock_ignoring_poison(&self.event_handler);
-        for root in changed_roots {
-            let Some(entry) = self.watches.get(root) else {
-                continue;
-            };
-            fsevent_debug!(
-                "root `{}` changed without a delivered RootChanged event; reporting it",
-                root.display()
-            );
-            // A delivered root rename arrives as a name change, which this
-            // recovery path cannot tell from a removal; a mask that would filter
-            // the removal still gets an unfilterable rescan for the root.
-            let removal = EventKind::Remove(RemoveKind::Any);
-            let event = if self.event_kinds.matches(&removal) {
-                Event::new(removal)
-            } else {
-                Event::new(EventKind::Other).set_flag(Flag::Rescan)
-            }
-            .set_info("root changed")
-            .add_path(entry.info.reported_path.clone());
-            event_handler.handle_event(Ok(event));
-        }
+        changed_roots
+            .into_iter()
+            .filter_map(|root| {
+                let entry = self.watches.get(root)?;
+                fsevent_debug!(
+                    "root `{}` changed without a delivered RootChanged event; reporting it",
+                    root.display()
+                );
+                // A delivered root rename arrives as a name change, which this
+                // recovery path cannot tell from a removal; a mask that would
+                // filter the removal still gets an unfilterable rescan for the root.
+                let removal = EventKind::Remove(RemoveKind::Any);
+                let event = if self.event_kinds.matches(&removal) {
+                    Event::new(removal)
+                } else {
+                    Event::new(EventKind::Other).set_flag(Flag::Rescan)
+                };
+                Some(
+                    event
+                        .set_info("root changed")
+                        .add_path(entry.info.reported_path.clone()),
+                )
+            })
+            .collect()
     }
 
     fn remove_path(&mut self, path: &Path) -> Result<()> {
@@ -2267,12 +2290,18 @@ mod tests {
                 break;
             }
             match rx.rx.recv_timeout(remaining) {
-                Ok(Ok(event)) => assert!(
-                    !is_root_change(&event),
-                    "the root change was delivered {:?} after the rename, inside the \
-                     {LATENCY:?} latency, so it was never held and the swap below proves nothing",
-                    renamed.elapsed()
-                ),
+                // fseventsd may deliver a root change without waiting out the
+                // latency (macOS 27 does, within microseconds), and then there
+                // is nothing held for the swap to lose.
+                Ok(Ok(event)) if is_root_change(&event) => {
+                    println!(
+                        "inconclusive: the root change was delivered {:?} after the rename, \
+                         inside the {LATENCY:?} latency, so it was never held",
+                        renamed.elapsed()
+                    );
+                    return;
+                }
+                Ok(Ok(_)) => {}
                 Ok(Err(error)) => panic!("watcher error before the swap: {error:?}"),
                 Err(_) => break,
             }
@@ -2430,7 +2459,7 @@ mod tests {
         let tmpdir = testdir();
         let root = tmpdir.path().join("root");
         std::fs::create_dir(&root).expect("create root");
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = std::sync::mpsc::channel();
         let mut watcher = FsEventWatcher::new(tx, Config::default()).expect("create watcher");
         watcher
             .append_path(&root, RecursiveMode::Recursive)
@@ -2443,15 +2472,16 @@ mod tests {
             .expect("rewatch root");
 
         let previous_roots = [root.canonicalize().expect("canonical root")];
-        watcher.report_root_changes_held_by(&previous_roots);
-        let events: Vec<Event> = rx.try_iter().collect::<crate::Result<_>>().expect("events");
+        let events = watcher.root_change_events(&previous_roots);
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0].kind, EventKind::Remove(RemoveKind::Any));
         assert_eq!(events[0].info(), Some("root changed"));
         assert_eq!(events[0].paths, vec![root]);
 
-        watcher.report_root_changes_held_by(&previous_roots);
-        assert!(rx.try_recv().is_err(), "the change is reported once");
+        assert!(
+            watcher.root_change_events(&previous_roots).is_empty(),
+            "the change is reported once"
+        );
     }
 
     #[test]
