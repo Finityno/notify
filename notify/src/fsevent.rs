@@ -375,7 +375,15 @@ impl RootIdentity {
     fn of(path: &Path) -> Self {
         match std::fs::symlink_metadata(path) {
             Ok(metadata) => Self::from(&metadata),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Missing,
+            // An ancestor replaced by a file makes the root just as gone.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Self::Missing
+            }
             Err(_) => Self::Unreadable,
         }
     }
@@ -2362,6 +2370,19 @@ mod tests {
                 .is_empty(),
             "a root readable again with the same identity is not a change"
         );
+    }
+
+    #[test]
+    fn a_root_under_an_ancestor_replaced_by_a_file_is_missing() {
+        let tmpdir = testdir();
+        let parent = tmpdir.path().join("parent");
+        let root = parent.join("root");
+        std::fs::create_dir_all(&root).expect("create root");
+        assert_ne!(RootIdentity::of(&root), RootIdentity::Missing);
+
+        std::fs::remove_dir_all(&parent).expect("remove parent");
+        std::fs::write(&parent, b"").expect("replace parent with a file");
+        assert_eq!(RootIdentity::of(&root), RootIdentity::Missing);
     }
 
     #[test]
