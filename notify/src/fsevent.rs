@@ -1062,7 +1062,15 @@ impl FsEventWatcher {
             .spawn(move || {
                 let mut event_handler = lock_ignoring_poison(&event_handler);
                 for event in events {
-                    event_handler.handle_event(Ok(event));
+                    // As in the stream callback, a panicking handler loses only
+                    // its own event.
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        event_handler.handle_event(Ok(event));
+                    }))
+                    .is_err()
+                    {
+                        log::error!("panic in FSEvents event handler; dropping event");
+                    }
                 }
             });
         if let Err(error) = spawned {
