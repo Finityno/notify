@@ -826,7 +826,7 @@ impl EventLoop {
         // If the watch is not recursive, or if we determine (by stat'ing the path to get its
         // metadata) that the watched path is not a directory, add a single path watch.
         if !requested_is_recursive {
-            return self.add_single_watch(path, false, dereference, true);
+            return self.add_single_watch(path, false, dereference, true, path_is_dir);
         }
 
         let root = path.clone();
@@ -850,6 +850,9 @@ impl EventLoop {
             .collect()
     }
 
+    /// Every path must be a directory once resolved: callers pass the output of
+    /// `recursive_directory_paths`, which yields only directories, so the watch records
+    /// `is_dir` without a stat of its own.
     fn add_watches_for_paths<I>(
         &mut self,
         paths: I,
@@ -864,7 +867,7 @@ impl EventLoop {
             // entries below the root were reached by following links, so they observe what they
             // resolved to
             let entry_dereference = if watch_self { dereference } else { true };
-            match self.add_single_watch(path, is_recursive, entry_dereference, watch_self) {
+            match self.add_single_watch(path, is_recursive, entry_dereference, watch_self, true) {
                 Ok(()) => {}
                 // TOCTOU: a subdirectory can disappear between walkdir listing it and us adding an
                 // inotify watch for it. This should not fail the overall recursive watch call.
@@ -883,6 +886,7 @@ impl EventLoop {
         is_recursive: bool,
         requested_dereference: bool,
         watch_self: bool,
+        is_dir: bool,
     ) -> Result<()> {
         // Build watch mask from configured event kinds for kernel-level filtering
         let mut watchmask = event_kind_mask_to_watch_mask(self.event_kind_mask, is_recursive);
@@ -911,11 +915,20 @@ impl EventLoop {
         if !dereference {
             add_mask.insert(WatchMask::DONT_FOLLOW);
         }
+        // the kernel then refuses a path that stopped being a directory since the caller's
+        // stat, so a recorded `is_dir` of true always holds for the inode actually watched
+        if is_dir {
+            add_mask.insert(WatchMask::ONLYDIR);
+        }
 
         if let Some(ref mut inotify) = self.inotify {
             log::trace!("adding inotify watch: {}", path.absolute.display());
 
             match inotify.watches().add(&path.absolute, add_mask) {
+                // retrying as a non-directory never takes this arm again, and its post-add
+                // stat records whatever type the path has by then
+                Err(e) if is_dir && e.raw_os_error() == Some(libc::ENOTDIR) => self
+                    .add_single_watch(path, is_recursive, requested_dereference, watch_self, false),
                 Err(e) => {
                     Err(if e.raw_os_error() == Some(libc::ENOSPC) {
                         // do not report inotify limits as "no more space" on linux #266
@@ -929,13 +942,19 @@ impl EventLoop {
                 }
                 Ok(w) => {
                     debug_assert!(!watchmask.intersects(RESOLUTION_FLAGS));
-                    let is_dir = match watch_metadata(&path.absolute, dereference) {
-                        Ok(metadata) => metadata.is_dir(),
-                        Err(e) => {
-                            // Avoid leaking an inotify watch if we can't stat after adding it.
-                            // This can happen due to racy deletions.
-                            let _ = inotify.watches().remove(w.clone());
-                            return Err(Error::io_watch(e).add_path(path.requested));
+                    // inotify has no inverse of ONLYDIR, so a path the caller saw as a file
+                    // is checked again in case a directory replaced it before the add
+                    let is_dir = if is_dir {
+                        true
+                    } else {
+                        match watch_metadata(&path.absolute, dereference) {
+                            Ok(metadata) => metadata.is_dir(),
+                            Err(e) => {
+                                // Avoid leaking an inotify watch if we can't stat after adding it.
+                                // This can happen due to racy deletions.
+                                let _ = inotify.watches().remove(w.clone());
+                                return Err(Error::io_watch(e).add_path(path.requested));
+                            }
                         }
                     };
                     let metadata = if let Some(existing_watch) = existing_watch {
@@ -2640,6 +2659,73 @@ mod tests {
         let watch = event_loop.watches.get(&link).expect("link watch");
         assert!(!watch.is_dir);
         assert!(!watch.dereference);
+    }
+
+    #[test]
+    fn watches_record_whether_the_path_is_a_directory() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().to_path_buf();
+        let directory = root.join("directory");
+        let nested = directory.join("nested");
+        let file = root.join("file");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(&file, b"").unwrap();
+        let file_link = root.join("file_link");
+        let directory_link = root.join("directory_link");
+        std::os::unix::fs::symlink(&file, &file_link).unwrap();
+        std::os::unix::fs::symlink(&directory, &directory_link).unwrap();
+
+        let mut event_loop = test_event_loop();
+        event_loop
+            .add_watch(WatchPath::new(&file).unwrap(), non_recursive_watch(), true)
+            .unwrap();
+        event_loop
+            .add_watch(WatchPath::new(&file_link).unwrap(), non_recursive_watch(), true)
+            .unwrap();
+        event_loop
+            .add_watch(
+                WatchPath::new(&directory_link).unwrap(),
+                non_recursive_watch().with_dereference_symlinks(false),
+                true,
+            )
+            .unwrap();
+        event_loop
+            .add_watch(WatchPath::new(&directory).unwrap(), recursive_watch(), true)
+            .unwrap();
+
+        assert!(!event_loop.watches.get(&file).unwrap().is_dir);
+        assert!(!event_loop.watches.get(&file_link).unwrap().is_dir);
+        assert!(!event_loop.watches.get(&directory_link).unwrap().is_dir);
+        assert!(event_loop.watches.get(&directory).unwrap().is_dir);
+        assert!(event_loop.watches.get(&nested).unwrap().is_dir);
+    }
+
+    #[test]
+    fn a_directory_replaced_by_a_file_before_the_add_is_recorded_as_a_file() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("replaced");
+        std::fs::write(&path, b"").unwrap();
+
+        let mut event_loop = test_event_loop();
+        event_loop
+            .add_single_watch(WatchPath::new(&path).unwrap(), false, true, true, true)
+            .unwrap();
+
+        assert!(!event_loop.watches.get(&path).unwrap().is_dir);
+    }
+
+    #[test]
+    fn a_file_replaced_by_a_directory_before_the_add_is_recorded_as_a_directory() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let path = tmpdir.path().join("replaced");
+        std::fs::create_dir(&path).unwrap();
+
+        let mut event_loop = test_event_loop();
+        event_loop
+            .add_single_watch(WatchPath::new(&path).unwrap(), false, true, true, false)
+            .unwrap();
+
+        assert!(event_loop.watches.get(&path).unwrap().is_dir);
     }
 
     #[test]
