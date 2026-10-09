@@ -364,13 +364,20 @@ impl ReplayFilter {
 enum RootIdentity {
     Present { device: u64, inode: u64 },
     Missing,
+    // A stat that failed for another reason, such as a parent losing search
+    // permission, says nothing about the root, so it never counts as a change.
+    Unreadable,
 }
 
 impl RootIdentity {
     // `symlink_metadata`, because a watched root is a canonical path: a symlink
     // now standing there is a change, not the thing it points to.
     fn of(path: &Path) -> Self {
-        std::fs::symlink_metadata(path).map_or(Self::Missing, |metadata| Self::from(&metadata))
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => Self::from(&metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Missing,
+            Err(_) => Self::Unreadable,
+        }
     }
 }
 
@@ -398,6 +405,9 @@ fn take_unreported_root_changes<'a>(
                 return false;
             };
             let current = current_identity(root);
+            if current == RootIdentity::Unreadable {
+                return false;
+            }
             let changed = current != *recorded;
             *recorded = current;
             changed
@@ -410,7 +420,10 @@ fn take_unreported_root_changes<'a>(
 fn record_root_identity(root: &Path, identities: &Mutex<HashMap<PathBuf, RootIdentity>>) {
     let mut identities = lock_ignoring_poison(identities);
     if let Some(identity) = identities.get_mut(root) {
-        *identity = RootIdentity::of(root);
+        let current = RootIdentity::of(root);
+        if current != RootIdentity::Unreadable {
+            *identity = current;
+        }
     }
 }
 
@@ -1042,12 +1055,18 @@ impl FsEventWatcher {
                 "root `{}` changed without a delivered RootChanged event; reporting it",
                 root.display()
             );
-            let event = Event::new(EventKind::Remove(RemoveKind::Any))
-                .set_info("root changed")
-                .add_path(entry.info.reported_path.clone());
-            if self.event_kinds.matches(&event.kind) {
-                event_handler.handle_event(Ok(event));
+            // A delivered root rename arrives as a name change, which this
+            // recovery path cannot tell from a removal; a mask that would filter
+            // the removal still gets an unfilterable rescan for the root.
+            let removal = EventKind::Remove(RemoveKind::Any);
+            let event = if self.event_kinds.matches(&removal) {
+                Event::new(removal)
+            } else {
+                Event::new(EventKind::Other).set_flag(Flag::Rescan)
             }
+            .set_info("root changed")
+            .add_path(entry.info.reported_path.clone());
+            event_handler.handle_event(Ok(event));
         }
     }
 
@@ -2318,6 +2337,30 @@ mod tests {
         assert!(
             take_unreported_root_changes(&previous_roots, &mut recorded, current).is_empty(),
             "a reported change is not reported again"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_root_is_not_reported_and_keeps_its_recorded_identity() {
+        let root = PathBuf::from("/root");
+        let recorded_identity = RootIdentity::Present {
+            device: 1,
+            inode: 10,
+        };
+        let mut recorded = HashMap::from([(root.clone(), recorded_identity)]);
+        let previous_roots = [root.clone()];
+
+        assert!(
+            take_unreported_root_changes(&previous_roots, &mut recorded, |_| {
+                RootIdentity::Unreadable
+            })
+            .is_empty()
+        );
+        assert_eq!(recorded[&root], recorded_identity);
+        assert!(
+            take_unreported_root_changes(&previous_roots, &mut recorded, |_| recorded_identity)
+                .is_empty(),
+            "a root readable again with the same identity is not a change"
         );
     }
 
