@@ -547,7 +547,7 @@ impl FsEventWatcher {
                     if self.runloop.is_some() {
                         let timeout = Duration::try_from_secs_f64(self.latency)
                             .unwrap_or(Duration::ZERO)
-                            + FLUSH_TIMEOUT;
+                            .saturating_add(FLUSH_TIMEOUT);
                         if !Self::flush_handle(&handle, timeout) {
                             log::warn!(
                                 "FSEvents stream did not flush within {timeout:?}; events it held back may be lost"
@@ -588,14 +588,19 @@ impl FsEventWatcher {
         if handle.thread_handle.thread().id() == thread::current().id() {
             return false;
         }
-        let deadline = Instant::now() + timeout;
+        // A latency large enough to overflow `Instant` waits without a deadline
+        // rather than panicking.
+        let deadline = Instant::now().checked_add(timeout);
         lock_ignoring_poison(&handle.progress.state).flush_target = None;
         handle.flush_source.signal();
         handle.runloop.wake_up();
 
         let mut state = lock_ignoring_poison(&handle.progress.state);
         while !state.flushed() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = match deadline {
+                Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+                None => timeout,
+            };
             if remaining.is_zero() {
                 return false;
             }
