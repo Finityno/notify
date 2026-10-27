@@ -349,11 +349,16 @@ impl ReplayFilter {
         if event_id == 0 || (event_id > self.swap_event_id && event_id > previous_delivered) {
             return None;
         }
-        // A rescan reported at an ancestor of the watches matches none of them,
-        // but the old stream delivered it all the same; see `callback_impl`.
-        if flags.contains(StreamFlags::MUST_SCAN_SUBDIRS)
-            || watch_for(&self.previous_watches, path).is_some()
-        {
+        // A rescan reported at an ancestor of the old stream's watches matches
+        // none of them, but the old stream delivered it all the same; see
+        // `callback_impl`. Rescans are rare, so the scan costs nothing.
+        let old_stream_delivers = watch_for(&self.previous_watches, path).is_some()
+            || (flags.contains(StreamFlags::MUST_SCAN_SUBDIRS)
+                && self
+                    .previous_watches
+                    .keys()
+                    .any(|watch_path| watch_path.starts_with(path)));
+        if old_stream_delivers {
             (event_id <= previous_delivered).then_some(ReplaySkip::AlreadyDelivered)
         } else {
             (event_id <= self.swap_event_id).then_some(ReplaySkip::PredatesWatch)
@@ -813,17 +818,38 @@ impl FsEventWatcher {
         let call_started_event_id = unsafe { fs::FSEventsGetCurrentEventId() };
         let path = self.append_path(path, recursive_mode)?;
         let entry = &self.watches[&path];
-        if self.is_covered(&path, entry.device)
-            && let Some(runloop) = &self.runloop
-        {
-            // The stream already delivers these events, and its roots do not
-            // change, so only the callback's path representation and recursive
-            // mode are updated; a swap would cost a new stream for nothing.
-            Arc::make_mut(&mut lock_ignoring_poison(&runloop.recursive_info))
-                .insert(path, entry.info.clone());
-            return Ok(());
+        if let Some(runloop) = &self.runloop {
+            let mut stream_watches = lock_ignoring_poison(&runloop.recursive_info);
+            if self.is_covered_by_stream(&path, entry.device, &stream_watches) {
+                // The stream already delivers these events, and its roots do not
+                // change, so only the callback's path representation and
+                // recursive mode are updated; a swap would cost a new stream for
+                // nothing.
+                Arc::make_mut(&mut stream_watches).insert(path, entry.info.clone());
+                return Ok(());
+            }
         }
         self.restart(call_started_event_id)
+    }
+
+    // Like `is_covered`, but by a recursive watch the running stream actually
+    // has: after a failed swap, `self.watches` holds watches the kept stream
+    // was never started with.
+    fn is_covered_by_stream(
+        &self,
+        path: &Path,
+        device: u64,
+        stream_watches: &HashMap<PathBuf, WatchInfo>,
+    ) -> bool {
+        path.ancestors().skip(1).any(|ancestor| {
+            stream_watches
+                .get(ancestor)
+                .is_some_and(|covering| covering.is_recursive)
+                && self
+                    .watches
+                    .get(ancestor)
+                    .is_some_and(|covering| covering.device == device)
+        })
     }
 
     fn unwatch_inner(&mut self, path: &Path) -> Result<()> {
@@ -2032,6 +2058,32 @@ mod tests {
     }
 
     #[test]
+    fn watch_staged_by_a_failed_swap_does_not_cover_later_watches() {
+        let tmpdir = testdir();
+        let first = tmpdir.path().join("first");
+        let second = tmpdir.path().join("second");
+        let child = second.join("child");
+        std::fs::create_dir(&first).expect("create first");
+        std::fs::create_dir_all(&child).expect("create child");
+
+        let (mut watcher, mut rx) = watcher();
+        watcher.watch_recursively(&first);
+        // What a swap that failed to start leaves behind: the watch is recorded
+        // but the kept stream was never started with it.
+        watcher
+            .watcher
+            .append_path(&second, RecursiveMode::Recursive)
+            .expect("stage second");
+        let thread_id = runloop_thread_id(&watcher.watcher);
+        watcher.watch_recursively(&child);
+        assert_ne!(runloop_thread_id(&watcher.watcher), thread_id);
+
+        let path = child.join("entry");
+        std::fs::File::create_new(&path).expect("create");
+        rx.wait_unordered([expected(path).create_file()]);
+    }
+
+    #[test]
     fn failed_watch_keeps_stream_running() {
         let tmpdir = testdir();
         let (mut watcher, mut rx) = watcher();
@@ -3104,9 +3156,9 @@ mod tests {
 
     #[test]
     fn replay_filter_keeps_an_ancestor_rescan_the_old_stream_still_owed() {
-        let filter = replay_filter(recursive_watch("/old"), 150);
+        let filter = replay_filter(recursive_watch("/top/old"), 150);
         let rescan = StreamFlags::MUST_SCAN_SUBDIRS | StreamFlags::USER_DROPPED;
-        for ancestor in [Path::new("/"), Path::new("/elsewhere")] {
+        for ancestor in [Path::new("/"), Path::new("/top")] {
             // The old stream delivered it as a rescan although no watch matches.
             assert_eq!(
                 filter.skip(ancestor, &rescan, 120, 150),
@@ -3116,6 +3168,15 @@ mod tests {
             // as predating the watch.
             assert_eq!(filter.skip(ancestor, &rescan, 160, 150), None);
         }
+
+        // A rescan for a path only the new stream watches was never the old
+        // stream's to deliver, however far the old stream got.
+        let added = Path::new("/added");
+        assert_eq!(filter.skip(added, &rescan, 230, 240), None);
+        assert_eq!(
+            filter.skip(added, &rescan, 160, 150),
+            Some(ReplaySkip::PredatesWatch)
+        );
     }
 
     #[test]
