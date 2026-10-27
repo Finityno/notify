@@ -22,16 +22,17 @@ use crate::{
 use crate::{PathOp, event::*};
 use objc2_core_foundation as cf;
 use objc2_core_services as fs;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, OsStr};
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 bitflags::bitflags! {
   #[repr(C)]
@@ -64,8 +65,6 @@ bitflags::bitflags! {
   }
 }
 
-const RUNLOOP_STOP_RECHECK_SECONDS: cf::CFTimeInterval = 0.5;
-
 /// FSEvents-based `Watcher` implementation
 pub struct FsEventWatcher {
     since_when: fs::FSEventStreamEventId,
@@ -75,6 +74,11 @@ pub struct FsEventWatcher {
     runloop: Option<RunLoopHandle>,
     watches: HashMap<PathBuf, WatchEntry>,
     event_kinds: EventKindMask,
+    swap_mechanism: SwapMechanism,
+    // Devices fseventsd keeps an event history for, which a replay needs.
+    devices_with_history: HashSet<u64>,
+    // Shared with every stream's callback; see `RootIdentity`.
+    root_identities: Arc<Mutex<HashMap<PathBuf, RootIdentity>>>,
 }
 
 // `cf_path` is kept out of `WatchInfo` because `WatchInfo` is shared with the stream
@@ -91,6 +95,13 @@ struct WatchInfo {
     is_recursive: bool,
     reported_path: PathBuf,
 }
+
+// The watch table a running stream's callback reads. A watch the stream already
+// covers is added to it in place rather than by swapping streams. The callback
+// takes the inner `Arc` once per batch, so it never holds the lock while it
+// calls the event handler, which may call back into the watcher; a watch added
+// while a batch is in flight copies the table instead of waiting for it.
+type StreamWatches = Arc<Mutex<Arc<HashMap<PathBuf, WatchInfo>>>>;
 
 // FSEvents applies the path limit across live streams, so all watcher instances
 // in this process must share the same count.
@@ -133,9 +144,352 @@ impl Drop for FseventsPathReservation {
 #[derive(Debug)]
 struct RunLoopHandle {
     runloop: cf::CFRetained<cf::CFRunLoop>,
-    stop_flag: Arc<AtomicBool>,
+    stop_source: cf::CFRetained<cf::CFRunLoopSource>,
+    flush_source: cf::CFRetained<cf::CFRunLoopSource>,
     thread_handle: thread::JoinHandle<()>,
-    recursive_info: Arc<Mutex<HashMap<PathBuf, WatchInfo>>>,
+    progress: Arc<StreamProgress>,
+    recursive_info: StreamWatches,
+    // The paths the stream was created with, when it watches them with
+    // `kFSEventStreamCreateFlagWatchRoot`.
+    watched_roots: Vec<PathBuf>,
+    stream_number: u64,
+}
+
+// How a swap keeps the events the old stream has not delivered yet. The
+// single-mechanism variants exist so the Mac tests can show which mechanism
+// actually delivers a held event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwapMechanism {
+    FlushAndReplay,
+    FlushOnly,
+    ReplayOnly,
+}
+
+impl SwapMechanism {
+    fn flushes(self) -> bool {
+        matches!(self, Self::FlushAndReplay | Self::FlushOnly)
+    }
+
+    fn replays(self) -> bool {
+        matches!(self, Self::FlushAndReplay | Self::ReplayOnly)
+    }
+}
+
+// Flush requests from `restart`, the flush source's answers to them, and what
+// the stream's callback has handed to the event handler; `restart` waits on it
+// before stopping the stream, and reads it to decide where the replacement
+// stream resumes.
+#[derive(Debug)]
+struct StreamProgress {
+    state: Mutex<FlushState>,
+    changed: Condvar,
+}
+
+impl StreamProgress {
+    fn new(start_event_id: fs::FSEventStreamEventId, history_pending: bool) -> Self {
+        Self {
+            state: Mutex::new(FlushState::new(start_event_id, history_pending)),
+            changed: Condvar::new(),
+        }
+    }
+}
+
+// A flush is complete once the flush source has answered it and the callback
+// has handed the event handler every event the service had queued for the
+// stream when it was asked. That is decided by the ids the callback has seen,
+// not by `FSEventStreamFlushSync` returning. A held zero-id `RootChanged`
+// event alone cannot be waited for this way. The generation keeps a flush
+// answered before a request was made from satisfying it.
+//
+// On macOS 27 the flush alone did not deliver an event held for the latency:
+// the wait ended within 5 ms and the event never arrived, so the id the flush
+// returned was already delivered. The replacement stream therefore also
+// replays history from `delivered`; see `replay_since`.
+#[derive(Debug)]
+struct FlushState {
+    requested: u64,
+    answered: u64,
+    flush_target: fs::FSEventStreamEventId,
+    // The highest event id the callback has seen, or, before the first
+    // callback, the id the stream started from. Every event the stream still
+    // owes has a larger id.
+    delivered: fs::FSEventStreamEventId,
+    started_at: Instant,
+    last_delivery_at: Option<Instant>,
+    // Started from a historical id and the `HistoryDone` sentinel has not
+    // arrived, so older events may be owed however long ago the last callback
+    // ran.
+    history_pending: bool,
+    retiring: bool,
+}
+
+impl FlushState {
+    fn new(start_event_id: fs::FSEventStreamEventId, history_pending: bool) -> Self {
+        Self {
+            requested: 0,
+            answered: 0,
+            flush_target: 0,
+            delivered: start_event_id,
+            started_at: Instant::now(),
+            last_delivery_at: None,
+            history_pending,
+            retiring: false,
+        }
+    }
+
+    fn request(&mut self) -> u64 {
+        self.requested += 1;
+        self.requested
+    }
+
+    // Taken before the flush starts, so a request made while it runs is not
+    // reported answered by it.
+    fn pending(&self) -> u64 {
+        self.requested
+    }
+
+    // `queued` is what `FSEventStreamFlushAsync` returned: the largest id ever
+    // queued for the stream, or 0 if none was.
+    fn answer(&mut self, generation: u64, queued: fs::FSEventStreamEventId) {
+        self.answered = self.answered.max(generation);
+        self.flush_target = self.flush_target.max(queued);
+    }
+
+    fn record_delivery(&mut self, highest_id: fs::FSEventStreamEventId, now: Instant) {
+        self.delivered = self.delivered.max(highest_id);
+        self.last_delivery_at = Some(now);
+    }
+
+    fn is_complete(&self, generation: u64) -> bool {
+        self.answered >= generation && self.delivered >= self.flush_target
+    }
+
+    // With `NoDefer`, an event is held only while a delivery happened within
+    // the latency; after a quiet period the next one is delivered at once. A
+    // young stream counts as active because events can be on their way to it
+    // from before its first callback.
+    fn may_hold_events(&self, now: Instant, hold_window: Duration) -> bool {
+        let last_activity = self
+            .last_delivery_at
+            .map_or(self.started_at, |delivered_at| {
+                delivered_at.max(self.started_at)
+            });
+        self.history_pending || now.saturating_duration_since(last_activity) <= hold_window
+    }
+}
+
+// Bounds how long a swap waits for the old stream's flushed events to pass
+// through the event handler. Hitting it means the handler or fseventsd is
+// wedged; the swap then goes ahead without the guarantee rather than hanging the
+// watch call.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Slack on top of the latency for a delivery the service has sent but the
+// stream's runloop has not run yet.
+const REPLAY_GRACE: Duration = Duration::from_secs(1);
+
+// How far back, in system-wide event ids, a swap replays when the old stream
+// is idle. Nothing is held then, but an event can still be on its way from
+// fseventsd; it is among the most recent ids. The cap keeps a swap on a
+// long-quiet watcher from reading the volume's history since its last event.
+const IDLE_REPLAY_EVENTS: fs::FSEventStreamEventId = 10_000;
+
+// Where the replacement stream resumes so that nothing the old stream still
+// owes is lost: everything after the last id the old stream delivered while
+// it may hold events, and otherwise only the most recent stretch of history.
+// `None` means history cannot be used and the stream starts from now.
+fn replay_since(
+    delivered: fs::FSEventStreamEventId,
+    current: fs::FSEventStreamEventId,
+    may_hold_events: bool,
+) -> Option<fs::FSEventStreamEventId> {
+    let since_when = if may_hold_events {
+        delivered
+    } else {
+        delivered.max(current.saturating_sub(IDLE_REPLAY_EVENTS))
+    }
+    .min(current);
+    // 0 would replay the volume's whole history.
+    (since_when != 0 && current != fs::kFSEventStreamEventIdSinceNow).then_some(since_when)
+}
+
+// What a stream started from a historical id must not deliver: events from
+// before the watch call on paths the previous stream did not watch, and events
+// the previous stream already delivered.
+#[derive(Debug)]
+struct ReplayFilter {
+    since_when: fs::FSEventStreamEventId,
+    // The current event id when the watch call began, sampled before the watch
+    // set changed: an event on a newly watched path with a larger id happened
+    // after the call started and is never classified `PredatesWatch`.
+    swap_event_id: fs::FSEventStreamEventId,
+    previous_watches: Arc<HashMap<PathBuf, WatchInfo>>,
+    previous_progress: Arc<StreamProgress>,
+    previous_stream: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplaySkip {
+    PredatesWatch,
+    AlreadyDelivered,
+}
+
+impl ReplayFilter {
+    // `previous_delivered` is read once per batch: a stale value can only let
+    // a duplicate through, never drop an event.
+    fn skip(
+        &self,
+        path: &Path,
+        flags: &StreamFlags,
+        event_id: fs::FSEventStreamEventId,
+        previous_delivered: fs::FSEventStreamEventId,
+    ) -> Option<ReplaySkip> {
+        // Zero-id events such as `RootChanged` are made by the stream itself
+        // and never come from history.
+        if event_id == 0 || (event_id > self.swap_event_id && event_id > previous_delivered) {
+            return None;
+        }
+        // A rescan reported at an ancestor of the watches matches none of them,
+        // but the old stream delivered it all the same; see `callback_impl`.
+        if flags.contains(StreamFlags::MUST_SCAN_SUBDIRS)
+            || watch_for(&self.previous_watches, path).is_some()
+        {
+            (event_id <= previous_delivered).then_some(ReplaySkip::AlreadyDelivered)
+        } else {
+            (event_id <= self.swap_event_id).then_some(ReplaySkip::PredatesWatch)
+        }
+    }
+}
+
+// A watched root's identity at the last moment the event handler was, or was
+// about to be, told about every change to it before then: when the watch was
+// added, just before a `RootChanged` event for it was handed over, or at a
+// swap. A `RootChanged` event has id 0, so neither the flush, which waits for
+// ids, nor the replay, which reads history, recovers one the old stream still
+// held when it was stopped. A swap therefore compares each root the old stream
+// watched against the identity recorded here and reports the ones that moved;
+// the comparison does not depend on how long fseventsd holds the event. A
+// reported change can repeat one the old stream delivered during the swap,
+// which is acceptable; a missed one is not. A root renamed away and back
+// between two checks keeps its identity and is not reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootIdentity {
+    Present { device: u64, inode: u64 },
+    Missing,
+    // A stat that failed for another reason, such as a parent losing search
+    // permission, says nothing about the root, so it never counts as a change.
+    Unreadable,
+}
+
+impl RootIdentity {
+    // `symlink_metadata`, because a watched root is a canonical path: a symlink
+    // now standing there is a change, not the thing it points to.
+    fn of(path: &Path) -> Self {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => Self::from(&metadata),
+            // An ancestor replaced by a file makes the root just as gone.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Self::Missing
+            }
+            Err(_) => Self::Unreadable,
+        }
+    }
+}
+
+impl From<&std::fs::Metadata> for RootIdentity {
+    fn from(metadata: &std::fs::Metadata) -> Self {
+        Self::Present {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+// The roots among `previous_roots` that are still watched and whose identity
+// differs from the recorded one, which is then brought up to date so the same
+// change is reported once.
+fn take_unreported_root_changes<'a>(
+    previous_roots: &'a [PathBuf],
+    recorded_identities: &mut HashMap<PathBuf, RootIdentity>,
+    mut current_identity: impl FnMut(&Path) -> RootIdentity,
+) -> Vec<&'a PathBuf> {
+    previous_roots
+        .iter()
+        .filter(|root| {
+            let Some(recorded) = recorded_identities.get_mut(root.as_path()) else {
+                return false;
+            };
+            let current = current_identity(root);
+            if current == RootIdentity::Unreadable {
+                return false;
+            }
+            let changed = current != *recorded;
+            *recorded = current;
+            changed
+        })
+        .collect()
+}
+
+// The stat is taken under the lock, so it is ordered against a swap's
+// comparison of the same root.
+fn record_root_identity(root: &Path, identities: &Mutex<HashMap<PathBuf, RootIdentity>>) {
+    let mut identities = lock_ignoring_poison(identities);
+    if let Some(identity) = identities.get_mut(root) {
+        let current = RootIdentity::of(root);
+        if current != RootIdentity::Unreadable {
+            *identity = current;
+        }
+    }
+}
+
+static NEXT_STREAM_NUMBER: AtomicU64 = AtomicU64::new(1);
+
+fn debug_logging_enabled() -> bool {
+    log::log_enabled!(log::Level::Debug) || debug_to_stderr()
+}
+
+#[cfg(test)]
+fn debug_to_stderr() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var_os("NOTIFY_FSEVENT_DEBUG").is_some_and(|value| value == "1"))
+}
+
+#[cfg(not(test))]
+fn debug_to_stderr() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn debug_clock() -> Duration {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
+
+macro_rules! fsevent_debug {
+    ($($argument:tt)*) => {{
+        log::debug!($($argument)*);
+        #[cfg(test)]
+        if debug_to_stderr() {
+            eprintln!(
+                "[fsevent {:>9.3}s {:?}] {}",
+                debug_clock().as_secs_f64(),
+                thread::current().id(),
+                format_args!($($argument)*)
+            );
+        }
+    }};
+}
+
+fn lock_ignoring_poison<T: ?Sized>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl fmt::Debug for FsEventWatcher {
@@ -147,6 +501,7 @@ impl fmt::Debug for FsEventWatcher {
             .field("event_handler", &Arc::as_ptr(&self.event_handler))
             .field("runloop", &self.runloop)
             .field("watches", &self.watches)
+            .field("swap_mechanism", &self.swap_mechanism)
             .finish()
     }
 }
@@ -366,8 +721,15 @@ fn translate_flags_with(flags: StreamFlags, precise: bool, mut emit: impl FnMut(
 
 struct StreamContextInfo {
     event_handler: Arc<Mutex<dyn EventHandler>>,
-    recursive_info: Arc<Mutex<HashMap<PathBuf, WatchInfo>>>,
+    recursive_info: StreamWatches,
     event_kinds: EventKindMask,
+    progress: Arc<StreamProgress>,
+    // Dropped at `HistoryDone`, so the previous stream's watch table is not
+    // kept for the life of this stream. Without it, later events can only be
+    // duplicates of the old stream's, never lost.
+    replay: Mutex<Option<ReplayFilter>>,
+    root_identities: Arc<Mutex<HashMap<PathBuf, RootIdentity>>>,
+    stream_number: u64,
 }
 
 // Free the context when the stream created by `FSEventStreamCreate` is released.
@@ -383,6 +745,46 @@ unsafe extern "C-unwind" fn release_context(info: *const libc::c_void) {
             info as *const StreamContextInfo as *mut StreamContextInfo,
         ));
     }
+}
+
+// Runs on the watcher thread, inside the running runloop, where
+// `CFRunLoopStop` is guaranteed to take effect.
+unsafe extern "C-unwind" fn stop_runloop_perform(_info: *mut std::ffi::c_void) {
+    if let Some(runloop) = cf::CFRunLoop::current() {
+        runloop.stop();
+    }
+}
+
+// What the flush source's perform needs. Owned by the runloop thread, which
+// invalidates the source before dropping it.
+struct FlushSourceInfo {
+    stream: fs::FSEventStreamRef,
+    progress: Arc<StreamProgress>,
+    stream_number: u64,
+}
+
+// Runs on the watcher thread, the thread the stream is scheduled on, so the
+// stream is only ever touched there. `FSEventStreamFlushAsync` asks the service
+// to send everything it holds back for `latency`; those events then reach the
+// callback through this runloop like any other delivery, after this perform
+// returns. No lock is held across the call, because the callback takes
+// `progress.state` too.
+unsafe extern "C-unwind" fn flush_stream_perform(info: *mut std::ffi::c_void) {
+    let info = unsafe { &*(info as *const FlushSourceInfo) };
+    let generation = lock_ignoring_poison(&info.progress.state).pending();
+    let queued = unsafe { fs::FSEventStreamFlushAsync(info.stream) };
+    let delivered = {
+        let mut state = lock_ignoring_poison(&info.progress.state);
+        state.answer(generation, queued);
+        state.delivered
+    };
+    info.progress.changed.notify_all();
+    fsevent_debug!(
+        "stream {}: FSEventStreamFlushAsync returned {queued} (delivered so far {delivered}, \
+         current event id {})",
+        info.stream_number,
+        unsafe { fs::FSEventsGetCurrentEventId() }
+    );
 }
 
 impl FsEventWatcher {
@@ -401,33 +803,33 @@ impl FsEventWatcher {
             runloop: None,
             watches: HashMap::new(),
             event_kinds,
+            swap_mechanism: SwapMechanism::FlushAndReplay,
+            devices_with_history: HashSet::new(),
+            root_identities: Arc::default(),
         })
     }
 
     fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
+        let call_started_event_id = unsafe { fs::FSEventsGetCurrentEventId() };
         let path = self.append_path(path, recursive_mode)?;
         let entry = &self.watches[&path];
         if self.is_covered(&path, entry.device)
             && let Some(runloop) = &self.runloop
         {
-            // The stream already delivers these events. Update the callback's path
-            // representation and recursive mode without rebuilding the stream.
-            runloop
-                .recursive_info
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            // The stream already delivers these events, and its roots do not
+            // change, so only the callback's path representation and recursive
+            // mode are updated; a swap would cost a new stream for nothing.
+            Arc::make_mut(&mut lock_ignoring_poison(&runloop.recursive_info))
                 .insert(path, entry.info.clone());
             return Ok(());
         }
-
-        self.stop();
-        self.run()
+        self.restart(call_started_event_id)
     }
 
     fn unwatch_inner(&mut self, path: &Path) -> Result<()> {
-        self.stop();
+        let call_started_event_id = unsafe { fs::FSEventsGetCurrentEventId() };
         let result = self.remove_path(path);
-        self.run()?;
+        self.restart(call_started_event_id)?;
         result
     }
 
@@ -435,8 +837,7 @@ impl FsEventWatcher {
         &mut self,
         ops: Vec<crate::PathOp>,
     ) -> crate::StdResult<(), crate::UpdatePathsError> {
-        self.stop();
-
+        let call_started_event_id = unsafe { fs::FSEventsGetCurrentEventId() };
         let result = crate::update_paths(ops, |op| match op {
             crate::PathOp::Watch(path, config) => self
                 .append_path(&path, config.recursive_mode())
@@ -447,7 +848,7 @@ impl FsEventWatcher {
                 .map_err(|e| (PathOp::Unwatch(path), e)),
         });
 
-        match self.run() {
+        match self.restart(call_started_event_id) {
             Err(run_error) => match result {
                 Ok(()) => Err(crate::UpdatePathsError {
                     source: run_error,
@@ -470,26 +871,265 @@ impl FsEventWatcher {
         self.runloop.is_some()
     }
 
+    // Replace the running stream (if any) with one watching the current path
+    // set. The new stream is started before the old one is stopped, so that a
+    // stream is watching at every moment: events firing inside a stop-then-start
+    // window would be silently dropped for every watched path, not just the one
+    // being (un)watched. Stopping a stream also drops whatever it still holds
+    // back for `latency` and any delivery its runloop has not run yet. The new
+    // stream therefore resumes from the last event id the old one delivered
+    // (see `replay_since` and `ReplayFilter`), and the old one is flushed (see
+    // `flush_handle`) before it is stopped, which is all that is left where the
+    // volume keeps no history. An event can be delivered through both streams
+    // during the swap; duplicates are fine, losses are not. If the new stream
+    // fails to start, the old one is kept running so the previous path set
+    // keeps delivering events.
+    // `call_started_event_id` is the current event id sampled before the watch
+    // call changed the watch set.
+    fn restart(&mut self, call_started_event_id: fs::FSEventStreamEventId) -> Result<()> {
+        let old_runloop = self.runloop.take();
+        let replay = old_runloop
+            .as_ref()
+            .and_then(|handle| self.replay_filter(handle, call_started_event_id));
+        let replaying = replay.is_some();
+        let mut result = self.run(replay);
+        if replaying && let Err(error) = &result {
+            log::warn!(
+                "FSEvents stream resuming from history did not start ({error:?}); starting from now"
+            );
+            result = self.run(None);
+        }
+        match &result {
+            Ok(()) => {
+                if let Some(handle) = old_runloop {
+                    // With no replacement stream there is nobody to hand over to,
+                    // and the remaining paths were all unwatched.
+                    if self.runloop.is_some()
+                        && self.swap_mechanism.flushes()
+                        && !Self::flush_handle(&handle, FLUSH_TIMEOUT)
+                    {
+                        log::warn!(
+                            "FSEvents stream did not flush within {FLUSH_TIMEOUT:?}; events it held back may be lost"
+                        );
+                    }
+                    let watched_roots = Self::stop_handle(handle);
+                    self.report_root_changes_held_by(&watched_roots);
+                }
+            }
+            Err(_) => {
+                debug_assert!(self.runloop.is_none());
+                self.runloop = old_runloop;
+            }
+        }
+        result
+    }
+
+    // Where the stream replacing `previous` resumes, or `None` to start it from
+    // now.
+    fn replay_filter(
+        &mut self,
+        previous: &RunLoopHandle,
+        call_started_event_id: fs::FSEventStreamEventId,
+    ) -> Option<ReplayFilter> {
+        let swap_event_id = unsafe { fs::FSEventsGetCurrentEventId() };
+        let hold_window = Duration::try_from_secs_f64(self.latency)
+            .unwrap_or(Duration::ZERO)
+            .saturating_add(REPLAY_GRACE);
+        let (delivered, may_hold_events) = {
+            let mut state = lock_ignoring_poison(&previous.progress.state);
+            state.retiring = true;
+            (
+                state.delivered,
+                state.may_hold_events(Instant::now(), hold_window),
+            )
+        };
+        fsevent_debug!(
+            "swap from stream {}: current event id {swap_event_id}, old stream delivered up to \
+             {delivered}, may hold events: {may_hold_events}, mechanism {:?}",
+            previous.stream_number,
+            self.swap_mechanism
+        );
+        if !self.swap_mechanism.replays() {
+            return None;
+        }
+        if let Some(device) = self.device_without_history() {
+            log::info!(
+                "FSEvents keeps no event history for device {device}; the replacement stream \
+                 starts from now, and only the flush covers events the old stream held"
+            );
+            return None;
+        }
+        let since_when = replay_since(delivered, swap_event_id, may_hold_events)?;
+        Some(ReplayFilter {
+            since_when,
+            swap_event_id: call_started_event_id.min(swap_event_id),
+            previous_watches: lock_ignoring_poison(&previous.recursive_info).clone(),
+            previous_progress: previous.progress.clone(),
+            previous_stream: previous.stream_number,
+        })
+    }
+
+    // A replay reads the event store of every volume the stream watches; one
+    // without a store (`FSEventsCopyUUIDForDevice` returns NULL, for example a
+    // read-only volume) has no history to replay. Only a store that exists is
+    // cached: a volume can gain one, for example when it is remounted
+    // read-write, and asking again costs one call per swap.
+    fn device_without_history(&mut self) -> Option<u64> {
+        for entry in self.watches.values() {
+            if self.devices_with_history.contains(&entry.device) {
+                continue;
+            }
+            let has_history = libc::dev_t::try_from(entry.device)
+                .is_ok_and(|device| unsafe { fs::FSEventsCopyUUIDForDevice(device).is_some() });
+            if !has_history {
+                return Some(entry.device);
+            }
+            self.devices_with_history.insert(entry.device);
+        }
+        None
+    }
+
     fn stop(&mut self) {
         if !self.is_running() {
             return;
         }
 
-        if let Some(RunLoopHandle {
+        if let Some(handle) = self.runloop.take() {
+            Self::stop_handle(handle);
+        }
+    }
+
+    // Has the old stream hand everything it holds to the event handler, and waits
+    // until the handler is through it. Returns false if that did not happen
+    // within `timeout`.
+    //
+    // The stream is flushed on its own runloop thread, which is alive until
+    // `stop_handle` signals it, so the request cannot be lost. Only the caller of
+    // `watch`/`unwatch` blocks, never the runloop; if that caller is the runloop
+    // thread itself (a watch call from inside the event handler) waiting would
+    // deadlock, so the flush is skipped.
+    fn flush_handle(handle: &RunLoopHandle, timeout: Duration) -> bool {
+        if handle.thread_handle.thread().id() == thread::current().id() {
+            return false;
+        }
+        let deadline = Instant::now() + timeout;
+        // Requested before signalling, so a completion of an earlier flush cannot
+        // satisfy this one.
+        let generation = lock_ignoring_poison(&handle.progress.state).request();
+        handle.flush_source.signal();
+        handle.runloop.wake_up();
+
+        let mut state = lock_ignoring_poison(&handle.progress.state);
+        while !state.is_complete(generation) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            state = handle
+                .progress
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+        true
+    }
+
+    // Returns the roots the stream watched, for `report_root_changes_held_by`.
+    fn stop_handle(handle: RunLoopHandle) -> Vec<PathBuf> {
+        let RunLoopHandle {
             runloop,
-            stop_flag,
+            stop_source,
             thread_handle,
+            progress,
+            watched_roots,
+            stream_number,
             ..
-        }) = self.runloop.take()
+        } = handle;
         {
-            // Don't wait for the runloop to become "waiting" before stopping; if the
-            // stream is under heavy load that can delay shutdown indefinitely.
-            stop_flag.store(true, Ordering::Release);
-            runloop.stop();
+            // Calling `CFRunLoopStop` directly here would race: it only takes effect
+            // while the runloop is actually running, so a stop landing in the window
+            // before the watcher thread enters `CFRunLoopRun` would be lost and the
+            // `join` below would deadlock. Signaling a runloop source instead is
+            // sticky: the signal stays pending until the loop runs, and the source's
+            // `perform` callback then stops the loop from the inside, where the stop
+            // cannot be lost. The wake-up covers the case where the loop is already
+            // asleep.
+            stop_source.signal();
             runloop.wake_up();
             // Wait for the thread to shut down.
             thread_handle.join().expect("thread to shut down");
         }
+        fsevent_debug!(
+            "stream {stream_number} stopped; last delivered id {}",
+            lock_ignoring_poison(&progress.state).delivered
+        );
+        watched_roots
+    }
+
+    // Runs once the old stream has stopped, so every `RootChanged` event it
+    // delivered has already updated `root_identities`; see `RootIdentity`.
+    //
+    // The events go to the handler from a thread of their own, as stream events
+    // do: this runs inside `watch`/`unwatch`, and a handler that calls back into
+    // the watcher, or takes a lock its caller holds, would deadlock on the
+    // caller's thread.
+    fn report_root_changes_held_by(&self, previous_roots: &[PathBuf]) {
+        let events = self.root_change_events(previous_roots);
+        if events.is_empty() {
+            return;
+        }
+        let event_handler = self.event_handler.clone();
+        let spawned = thread::Builder::new()
+            .name("notify-rs fsevents root changes".to_string())
+            .spawn(move || {
+                let mut event_handler = lock_ignoring_poison(&event_handler);
+                for event in events {
+                    // As in the stream callback, a panicking handler loses only
+                    // its own event.
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        event_handler.handle_event(Ok(event));
+                    }))
+                    .is_err()
+                    {
+                        log::error!("panic in FSEvents event handler; dropping event");
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            log::warn!("could not report watched roots that changed during a stream swap: {error}");
+        }
+    }
+
+    fn root_change_events(&self, previous_roots: &[PathBuf]) -> Vec<Event> {
+        let changed_roots = {
+            let mut identities = lock_ignoring_poison(&self.root_identities);
+            take_unreported_root_changes(previous_roots, &mut identities, RootIdentity::of)
+        };
+        changed_roots
+            .into_iter()
+            .filter_map(|root| {
+                let entry = self.watches.get(root)?;
+                fsevent_debug!(
+                    "root `{}` changed without a delivered RootChanged event; reporting it",
+                    root.display()
+                );
+                // A delivered root rename arrives as a name change, which this
+                // recovery path cannot tell from a removal; a mask that would
+                // filter the removal still gets an unfilterable rescan for the root.
+                let removal = EventKind::Remove(RemoveKind::Any);
+                let event = if self.event_kinds.matches(&removal) {
+                    Event::new(removal)
+                } else {
+                    Event::new(EventKind::Other).set_flag(Flag::Rescan)
+                };
+                Some(
+                    event
+                        .set_info("root changed")
+                        .add_path(entry.info.reported_path.clone()),
+                )
+            })
+            .collect()
     }
 
     fn remove_path(&mut self, path: &Path) -> Result<()> {
@@ -506,7 +1146,10 @@ impl FsEventWatcher {
             .unwrap_or_else(|| path.to_owned());
 
         match self.watches.remove(&p) {
-            Some(_) => Ok(()),
+            Some(_) => {
+                lock_ignoring_poison(&self.root_identities).remove(&p);
+                Ok(())
+            }
             None => Err(Error::watch_not_found()),
         }
     }
@@ -527,8 +1170,14 @@ impl FsEventWatcher {
             return Err(Error::path_not_found().add_path(path.into()));
         };
 
-        let device = std::fs::metadata(&canonical_path)?.dev();
+        let metadata = std::fs::metadata(&canonical_path)?;
+        let device = metadata.dev();
 
+        // A rewatch keeps the recorded identity: a change to the root before
+        // it has not been reported yet.
+        lock_ignoring_poison(&self.root_identities)
+            .entry(canonical_path.clone())
+            .or_insert_with(|| RootIdentity::from(&metadata));
         self.watches.insert(
             canonical_path.clone(),
             WatchEntry {
@@ -553,18 +1202,32 @@ impl FsEventWatcher {
         })
     }
 
+    fn stream_roots(&self) -> impl Iterator<Item = (&PathBuf, &WatchEntry)> {
+        self.watches
+            .iter()
+            .filter(|(path, entry)| !self.is_covered(path, entry.device))
+    }
+
+    #[cfg(test)]
     fn stream_paths(&self) -> cf::CFRetained<cf::CFMutableArray<cf::CFString>> {
         let paths: cf::CFRetained<cf::CFMutableArray<cf::CFString>> = cf::CFMutableArray::empty();
-        for (path, entry) in &self.watches {
-            if !self.is_covered(path, entry.device) {
-                paths.append(&entry.cf_path);
-            }
+        for (_, entry) in self.stream_roots() {
+            paths.append(&entry.cf_path);
         }
         paths
     }
 
-    fn run(&mut self) -> Result<()> {
-        let stream_paths = self.stream_paths();
+    fn run(&mut self, replay: Option<ReplayFilter>) -> Result<()> {
+        let watches_roots = self.flags & fs::kFSEventStreamCreateFlagWatchRoot != 0;
+        let stream_paths: cf::CFRetained<cf::CFMutableArray<cf::CFString>> =
+            cf::CFMutableArray::empty();
+        let mut watched_roots = Vec::new();
+        for (path, entry) in self.stream_roots() {
+            stream_paths.append(&entry.cf_path);
+            if watches_roots {
+                watched_roots.push(path.clone());
+            }
+        }
         if stream_paths.is_empty() {
             return Ok(());
         }
@@ -588,20 +1251,56 @@ impl FsEventWatcher {
                 }
             };
 
-        // We need to associate the stream context with our callback in order to propagate events
-        // to the rest of the system. This will be owned by the stream, and will be freed when the
-        // stream is closed. This means we will leak the context if we panic before reaching
-        // `FSEventStreamRelease`.
-        let recursive_info = Arc::new(Mutex::new(
+        let since_when = replay
+            .as_ref()
+            .map_or(self.since_when, |replay| replay.since_when);
+        // Sampled before the stream is created, so every event the stream will
+        // deliver has a larger id.
+        let start_event_id = if since_when == fs::kFSEventStreamEventIdSinceNow {
+            unsafe { fs::FSEventsGetCurrentEventId() }
+        } else {
+            since_when
+        };
+        let progress = Arc::new(StreamProgress::new(start_event_id, replay.is_some()));
+        let stream_number = NEXT_STREAM_NUMBER.fetch_add(1, Ordering::Relaxed);
+        let recursive_info: StreamWatches = Arc::new(Mutex::new(Arc::new(
             self.watches
                 .iter()
                 .map(|(path, entry)| (path.clone(), entry.info.clone()))
                 .collect(),
-        ));
+        )));
+        if debug_logging_enabled() {
+            match &replay {
+                Some(replay) => fsevent_debug!(
+                    "stream {stream_number}: replacing stream {} with sinceWhen {since_when} \
+                     (watch call at event id {}), {path_count} paths",
+                    replay.previous_stream,
+                    replay.swap_event_id
+                ),
+                None => fsevent_debug!(
+                    "stream {stream_number}: sinceWhen {} (current event id {start_event_id}), \
+                     {path_count} paths",
+                    if since_when == fs::kFSEventStreamEventIdSinceNow {
+                        "now".to_string()
+                    } else {
+                        since_when.to_string()
+                    }
+                ),
+            }
+        }
+
+        // We need to associate the stream context with our callback in order to propagate events
+        // to the rest of the system. This will be owned by the stream, and will be freed when the
+        // stream is closed. This means we will leak the context if we panic before reaching
+        // `FSEventStreamRelease`.
         let context = Box::into_raw(Box::new(StreamContextInfo {
             event_handler: self.event_handler.clone(),
             recursive_info: recursive_info.clone(),
             event_kinds: self.event_kinds,
+            progress: progress.clone(),
+            replay: Mutex::new(replay),
+            root_identities: self.root_identities.clone(),
+            stream_number,
         }));
 
         let stream_context = fs::FSEventStreamContext {
@@ -618,17 +1317,22 @@ impl FsEventWatcher {
                 Some(callback),
                 &stream_context as *const _ as *mut _,
                 stream_paths.as_opaque(),
-                self.since_when,
+                since_when,
                 self.latency,
                 self.flags,
             )
         };
 
         // Wrapper to help send CFRunLoop types across threads.
-        struct CFRunLoopSendWrapper(cf::CFRetained<cf::CFRunLoop>);
+        struct CFRunLoopSendWrapper(
+            cf::CFRetained<cf::CFRunLoop>,
+            cf::CFRetained<cf::CFRunLoopSource>,
+            cf::CFRetained<cf::CFRunLoopSource>,
+        );
 
         // Safety:
-        // - According to the Apple documentation, it's safe to move `CFRunLoop`s across threads.
+        // - According to the Apple documentation, it's safe to move `CFRunLoop`s and
+        //   `CFRunLoopSource`s across threads.
         //   https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Multithreading/ThreadSafetySummary/ThreadSafetySummary.html
         unsafe impl Send for CFRunLoopSendWrapper {}
 
@@ -645,11 +1349,7 @@ impl FsEventWatcher {
         // channel to pass runloop around
         let (rl_tx, rl_rx) = unbounded();
 
-        // Used to stop the runloop thread without relying on privileged APIs or
-        // on `CFRunLoopIsWaiting()` becoming true under heavy event load.
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let stop_flag_thread = Arc::clone(&stop_flag);
-
+        let flush_progress = progress.clone();
         let thread_handle = thread::Builder::new()
             .name("notify-rs fsevents loop".to_string())
             .spawn(move || {
@@ -680,24 +1380,75 @@ impl FsEventWatcher {
                         return;
                     }
 
-                    // `stop()` will call `CFRunLoopStop` + `CFRunLoopWakeUp` and then join this
-                    // thread.
+                    // The source through which stop() asks this thread to shut down. It
+                    // must be created and added to the runloop before the handles are
+                    // published below, so the caller can never signal a source that is
+                    // not registered yet.
+                    let mut stop_source_context = cf::CFRunLoopSourceContext {
+                        version: 0,
+                        info: ptr::null_mut(),
+                        retain: None,
+                        release: None,
+                        copyDescription: None,
+                        equal: None,
+                        hash: None,
+                        schedule: None,
+                        cancel: None,
+                        perform: Some(stop_runloop_perform),
+                    };
+                    let stop_source = cf::CFRunLoopSource::new(
+                        cf::kCFAllocatorDefault,
+                        0,
+                        &mut stop_source_context,
+                    )
+                    .expect("Failed to create stop source");
+                    cur_runloop.add_source(Some(&stop_source), cf::kCFRunLoopDefaultMode);
+
+                    // The source through which `restart` asks this thread to flush the
+                    // stream before it is replaced; see `flush_handle`. `flush_info`
+                    // outlives the source, which is invalidated before it is dropped.
+                    let mut flush_info = FlushSourceInfo {
+                        stream,
+                        progress: flush_progress,
+                        stream_number,
+                    };
+                    let mut flush_source_context = cf::CFRunLoopSourceContext {
+                        version: 0,
+                        info: &mut flush_info as *mut FlushSourceInfo as *mut libc::c_void,
+                        retain: None,
+                        release: None,
+                        copyDescription: None,
+                        equal: None,
+                        hash: None,
+                        schedule: None,
+                        cancel: None,
+                        perform: Some(flush_stream_perform),
+                    };
+                    let flush_source = cf::CFRunLoopSource::new(
+                        cf::kCFAllocatorDefault,
+                        0,
+                        &mut flush_source_context,
+                    )
+                    .expect("Failed to create flush source");
+                    cur_runloop.add_source(Some(&flush_source), cf::kCFRunLoopDefaultMode);
+
+                    // `stop()` will signal `stop_source`, wake the runloop, and then join
+                    // this thread.
                     rl_tx
-                        .send(Ok(CFRunLoopSendWrapper(cur_runloop)))
+                        .send(Ok(CFRunLoopSendWrapper(
+                            cur_runloop,
+                            stop_source.clone(),
+                            flush_source.clone(),
+                        )))
                         .expect("Unable to send runloop to watcher");
 
-                    // `CFRunLoopStop` is discarded if `stop()` calls it before this thread
-                    // enters the runloop, so re-check the stop flag after each bounded run.
-                    while !stop_flag_thread.load(Ordering::Acquire) {
-                        let result = cf::CFRunLoop::run_in_mode(
-                            cf::kCFRunLoopDefaultMode,
-                            RUNLOOP_STOP_RECHECK_SECONDS,
-                            false,
-                        );
-                        if result == cf::CFRunLoopRunResult::Finished {
-                            break;
-                        }
-                    }
+                    // Block until the pending signal on `stop_source` (if any) or a later
+                    // one stops the loop from the inside; see `stop()`.
+                    cf::CFRunLoop::run();
+
+                    flush_source.invalidate();
+                    drop(flush_info);
+                    stop_source.invalidate();
                     fs::FSEventStreamStop(stream);
                     fs::FSEventStreamInvalidate(stream);
                     fs::FSEventStreamRelease(stream);
@@ -723,9 +1474,13 @@ impl FsEventWatcher {
         };
         self.runloop = Some(RunLoopHandle {
             runloop: runloop_wrapper.0,
-            stop_flag,
+            stop_source: runloop_wrapper.1,
+            flush_source: runloop_wrapper.2,
             thread_handle,
+            progress,
             recursive_info,
+            watched_roots,
+            stream_number,
         });
 
         Ok(())
@@ -773,50 +1528,52 @@ unsafe extern "C-unwind" fn callback(
     });
 }
 
-/// The watch an event at `path` belongs to, if any: the most specific of the
-/// path itself, its parent, or an ancestor watched recursively.
-///
-/// The path and its ancestors are looked up by hash, nearest first, rather
-/// than scanning every watched path, so deciding an event costs one lookup
-/// per component of its path, however many paths are watched. The callback
-/// runs this for every event FSEvents delivers, and a scan of every watch
-/// slows delivery in proportion to how many there are.
-fn watch_for<'a>(
-    recursive_info: &'a HashMap<PathBuf, WatchInfo>,
-    path: &Path,
-) -> Option<(&'a PathBuf, &'a WatchInfo)> {
-    if let Some(watch) = recursive_info.get_key_value(path) {
-        return Some(watch);
-    }
-    path.ancestors()
-        .skip(1)
-        .enumerate()
-        .find_map(|(depth, ancestor)| {
-            let (watch_path, watch_info) = recursive_info.get_key_value(ancestor)?;
-            (watch_info.is_recursive || depth == 0).then_some((watch_path, watch_info))
-        })
-}
-
 unsafe fn callback_impl(
     _stream_ref: fs::ConstFSEventStreamRef,
     info: *mut libc::c_void,
     num_events: libc::size_t,                          // size_t numEvents
     event_paths: NonNull<libc::c_void>,                // void *eventPaths
     event_flags: NonNull<fs::FSEventStreamEventFlags>, // const FSEventStreamEventFlags eventFlags[]
-    _event_ids: NonNull<fs::FSEventStreamEventId>,     // const FSEventStreamEventId eventIds[]
+    event_ids: NonNull<fs::FSEventStreamEventId>,      // const FSEventStreamEventId eventIds[]
 ) {
     let event_paths = event_paths.as_ptr() as *const *const libc::c_char;
     let info = info as *const StreamContextInfo;
     let event_handler_mutex = &(*info).event_handler;
     let event_kinds = (*info).event_kinds;
+    let mut replay_guard = lock_ignoring_poison(unsafe { &(*info).replay });
+    let replay = replay_guard.as_ref();
+    let progress = unsafe { &(*info).progress };
+    let recursive_info = lock_ignoring_poison(unsafe { &(*info).recursive_info }).clone();
+    let event_ids = unsafe { std::slice::from_raw_parts(event_ids.as_ptr(), num_events) };
     let mut event_handler_guard = None;
+    let mut history_done = false;
+    let mut highest_id = None;
 
-    for p in 0..num_events {
+    let previous_delivered =
+        replay.map(|replay| lock_ignoring_poison(&replay.previous_progress.state).delivered);
+    let debug = debug_logging_enabled();
+    if debug {
+        let role = if lock_ignoring_poison(&progress.state).retiring {
+            "old"
+        } else if replay.is_some() {
+            "new"
+        } else {
+            "live"
+        };
+        fsevent_debug!(
+            "stream {} ({role}): batch of {num_events}, ids {:?}..{:?}",
+            unsafe { (*info).stream_number },
+            event_ids.first(),
+            event_ids.last()
+        );
+    }
+
+    for (index, &event_id) in event_ids.iter().enumerate() {
         // Paths are not guaranteed to be valid UTF-8 (e.g. NFS); keep them as raw bytes.
-        let path = CStr::from_ptr(*event_paths.add(p));
+        let path = CStr::from_ptr(*event_paths.add(index));
         let path = Path::new(OsStr::from_bytes(path.to_bytes()));
 
-        let raw_flag = *event_flags.as_ptr().add(p) as u32;
+        let raw_flag = *event_flags.as_ptr().add(index) as u32;
         let flag = StreamFlags::from_bits_truncate(raw_flag);
         let unknown_bits = raw_flag & !StreamFlags::all().bits();
         if unknown_bits != 0 {
@@ -824,17 +1581,46 @@ unsafe fn callback_impl(
             log::trace!("unknown FSEventStreamEventFlags bits: 0x{unknown_bits:08x}");
         }
 
-        let recursive_info = (*info)
-            .recursive_info
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let skip = if flag.contains(StreamFlags::HISTORY_DONE) {
+            // The sentinel's id is not an event's.
+            history_done = true;
+            Some("history done")
+        } else {
+            highest_id = highest_id.max(Some(event_id));
+            replay
+                .zip(previous_delivered)
+                .and_then(|(replay, previous_delivered)| {
+                    replay
+                        .skip(path, &flag, event_id, previous_delivered)
+                        .map(|skip| match skip {
+                            ReplaySkip::PredatesWatch => "replayed, predates the watch",
+                            ReplaySkip::AlreadyDelivered => "replayed, old stream delivered it",
+                        })
+                })
+        };
+        if debug {
+            fsevent_debug!(
+                "stream {}:   id {event_id} flags {flag:?} (0x{raw_flag:08x}) path `{}`{}",
+                unsafe { (*info).stream_number },
+                path.display(),
+                skip.map(|reason| format!(" -> skipped: {reason}"))
+                    .unwrap_or_default()
+            );
+        }
+        if skip.is_some() {
+            continue;
+        }
+        // Before the event reaches the handler, so a change after the stat is
+        // still caught by the next swap's comparison.
+        if flag.contains(StreamFlags::ROOT_CHANGED) {
+            record_root_identity(path, unsafe { &(*info).root_identities });
+        }
+
         let Some((watch_path, watch_info)) = watch_for(&recursive_info, path) else {
-            // FSEvents reports MustScanSubDirs at an ancestor of the
-            // registered watches (often `/` or the common parent). Those
-            // paths fail membership, but the recovery notice must still
-            // reach the handler.
+            // FSEvents reports MustScanSubDirs at an ancestor of the watched
+            // paths (often `/` or their common parent). No watch matches it,
+            // but the handler still has to learn that it must rescan.
             if flag.contains(StreamFlags::MUST_SCAN_SUBDIRS) {
-                drop(recursive_info);
                 let mut ev = Event::new(EventKind::Other).set_flag(Flag::Rescan);
                 ev = if flag.contains(StreamFlags::USER_DROPPED) {
                     ev.set_info("rescan: user dropped")
@@ -845,18 +1631,15 @@ unsafe fn callback_impl(
                 };
                 ev.paths.push(path.to_path_buf());
                 if event_kinds.matches(&ev.kind) {
-                    let event_handler = event_handler_guard.get_or_insert_with(|| {
-                        match event_handler_mutex.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        }
-                    });
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let event_handler = event_handler_guard
+                        .get_or_insert_with(|| lock_ignoring_poison(event_handler_mutex));
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         event_handler.handle_event(Ok(ev));
                     }))
-                    .map_err(|_| {
+                    .is_err()
+                    {
                         log::error!("panic in FSEvents event handler; dropping event");
-                    });
+                    }
                 }
             }
             continue;
@@ -867,8 +1650,6 @@ unsafe fn callback_impl(
         }
         // Most FSEvents flags produce one Event; move the reported path in that case.
         let mut event_path = Some(reported_path(watch_path, &watch_info.reported_path, path));
-        // Do not hold the watch information lock while invoking user code.
-        drop(recursive_info);
         let single_translated_event = translated_count == 1;
 
         log::trace!("FSEvent: path = `{}`, flag = {:?}", path.display(), flag);
@@ -901,6 +1682,56 @@ unsafe fn callback_impl(
             });
         });
     }
+
+    // Recorded only once the handler is through the whole batch, and after its
+    // lock is released, so a waiting `flush_handle` never sees a delivery that
+    // is still in progress, and a replacement stream that resumes from it can
+    // only repeat, never skip, an event from this batch.
+    drop(event_handler_guard);
+    if history_done && let Some(replay) = replay_guard.take() {
+        fsevent_debug!(
+            "stream {}: history replay since {} done",
+            unsafe { (*info).stream_number },
+            replay.since_when
+        );
+    }
+    drop(replay_guard);
+    if highest_id.is_some() || history_done {
+        {
+            let mut state = lock_ignoring_poison(&progress.state);
+            if let Some(highest_id) = highest_id {
+                state.record_delivery(highest_id, Instant::now());
+            }
+            if history_done {
+                state.history_pending = false;
+            }
+        }
+        progress.changed.notify_all();
+    }
+}
+
+/// The watch an event at `path` belongs to, if any: the most specific of the
+/// path itself, its parent, or an ancestor watched recursively.
+///
+/// The path and its ancestors are looked up by hash, nearest first, rather
+/// than scanning every watched path, so deciding an event costs one lookup
+/// per component of its path, however many paths are watched. The callback
+/// runs this for every event FSEvents delivers, and a scan of every watch
+/// slows delivery in proportion to how many there are.
+fn watch_for<'a>(
+    recursive_info: &'a HashMap<PathBuf, WatchInfo>,
+    path: &Path,
+) -> Option<(&'a PathBuf, &'a WatchInfo)> {
+    if let Some(watch) = recursive_info.get_key_value(path) {
+        return Some(watch);
+    }
+    path.ancestors()
+        .skip(1)
+        .enumerate()
+        .find_map(|(depth, ancestor)| {
+            let (watch_path, watch_info) = recursive_info.get_key_value(ancestor)?;
+            (watch_info.is_recursive || depth == 0).then_some((watch_path, watch_info))
+        })
 }
 
 impl Watcher for FsEventWatcher {
@@ -1144,6 +1975,82 @@ mod tests {
     }
 
     #[test]
+    fn covered_watch_updates_callback_without_restarting_stream() {
+        let tmpdir = testdir();
+        let root = tmpdir.path().join("root");
+        let child = root.join("child");
+        let nested = child.join("nested");
+        let alias = tmpdir.path().join("alias");
+        std::fs::create_dir_all(&nested).expect("create dirs");
+        std::os::unix::fs::symlink(&child, &alias).expect("symlink");
+
+        let (mut watcher, mut rx) = watcher();
+        watcher.watch_recursively(&root);
+        let thread_id = runloop_thread_id(&watcher.watcher);
+        watcher.watch_recursively(&alias);
+        assert_eq!(runloop_thread_id(&watcher.watcher), thread_id);
+
+        std::fs::File::create_new(nested.join("first")).expect("create");
+        rx.wait_unordered([expected(alias.join("nested/first")).create_file()]);
+
+        watcher.watch_nonrecursively(&alias);
+        assert_eq!(runloop_thread_id(&watcher.watcher), thread_id);
+        assert!(
+            watcher
+                .watcher
+                .watched_paths()
+                .expect("watched paths")
+                .contains(&(alias.clone(), RecursiveMode::NonRecursive))
+        );
+
+        std::fs::File::create_new(child.join("immediate")).expect("create");
+        std::fs::File::create_new(nested.join("second")).expect("create");
+        rx.wait_unordered([
+            expected(alias.join("immediate")).create_file(),
+            // The non-recursive alias no longer matches deeper events, but the
+            // original recursive root still covers them.
+            expected(nested.join("second")).create_file(),
+        ]);
+    }
+
+    #[test]
+    fn non_recursive_parent_does_not_skip_stream_restart() {
+        let tmpdir = testdir();
+        let child = tmpdir.path().join("child");
+        let nested = child.join("nested");
+        std::fs::create_dir_all(&nested).expect("create dirs");
+
+        let (mut watcher, mut rx) = watcher();
+        watcher.watch_nonrecursively(&tmpdir);
+        let thread_id = runloop_thread_id(&watcher.watcher);
+        watcher.watch_recursively(&child);
+        assert_ne!(runloop_thread_id(&watcher.watcher), thread_id);
+
+        let path = nested.join("entry");
+        std::fs::File::create_new(&path).expect("create");
+        rx.wait_unordered([expected(path).create_file()]);
+    }
+
+    #[test]
+    fn failed_watch_keeps_stream_running() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = watcher();
+        watcher.watch_recursively(&tmpdir);
+        let thread_id = runloop_thread_id(&watcher.watcher);
+
+        let err = watcher
+            .watcher
+            .watch(&tmpdir.path().join("missing"), RecursiveMode::Recursive)
+            .expect_err("watch missing path");
+        assert!(matches!(err.kind, ErrorKind::PathNotFound));
+        assert_eq!(runloop_thread_id(&watcher.watcher), thread_id);
+
+        let path = tmpdir.path().join("entry");
+        std::fs::File::create_new(&path).expect("create");
+        rx.wait_unordered([expected(path).create_file()]);
+    }
+
+    #[test]
     fn rewatching_same_path_replaces_recursive_info() {
         let dir = tempfile::tempdir().unwrap();
         let mut watcher = FsEventWatcher::new(|_| {}, Config::default()).unwrap();
@@ -1231,82 +2138,6 @@ mod tests {
     }
 
     #[test]
-    fn covered_watch_updates_callback_without_restarting_stream() {
-        let tmpdir = testdir();
-        let root = tmpdir.path().join("root");
-        let child = root.join("child");
-        let nested = child.join("nested");
-        let alias = tmpdir.path().join("alias");
-        std::fs::create_dir_all(&nested).expect("create dirs");
-        std::os::unix::fs::symlink(&child, &alias).expect("symlink");
-
-        let (mut watcher, mut rx) = watcher();
-        watcher.watch_recursively(&root);
-        let thread_id = runloop_thread_id(&watcher.watcher);
-        watcher.watch_recursively(&alias);
-        assert_eq!(runloop_thread_id(&watcher.watcher), thread_id);
-
-        std::fs::File::create_new(nested.join("first")).expect("create");
-        rx.wait_unordered([expected(alias.join("nested/first")).create_file()]);
-
-        watcher.watch_nonrecursively(&alias);
-        assert_eq!(runloop_thread_id(&watcher.watcher), thread_id);
-        assert!(
-            watcher
-                .watcher
-                .watched_paths()
-                .expect("watched paths")
-                .contains(&(alias.clone(), RecursiveMode::NonRecursive))
-        );
-
-        std::fs::File::create_new(child.join("immediate")).expect("create");
-        std::fs::File::create_new(nested.join("second")).expect("create");
-        rx.wait_unordered([
-            expected(alias.join("immediate")).create_file(),
-            // The non-recursive alias no longer matches deeper events, but the
-            // original recursive root still covers them.
-            expected(nested.join("second")).create_file(),
-        ]);
-    }
-
-    #[test]
-    fn non_recursive_parent_does_not_skip_stream_restart() {
-        let tmpdir = testdir();
-        let child = tmpdir.path().join("child");
-        let nested = child.join("nested");
-        std::fs::create_dir_all(&nested).expect("create dirs");
-
-        let (mut watcher, mut rx) = watcher();
-        watcher.watch_nonrecursively(&tmpdir);
-        let thread_id = runloop_thread_id(&watcher.watcher);
-        watcher.watch_recursively(&child);
-        assert_ne!(runloop_thread_id(&watcher.watcher), thread_id);
-
-        let path = nested.join("entry");
-        std::fs::File::create_new(&path).expect("create");
-        rx.wait_unordered([expected(path).create_file()]);
-    }
-
-    #[test]
-    fn failed_watch_keeps_stream_running() {
-        let tmpdir = testdir();
-        let (mut watcher, mut rx) = watcher();
-        watcher.watch_recursively(&tmpdir);
-        let thread_id = runloop_thread_id(&watcher.watcher);
-
-        let err = watcher
-            .watcher
-            .watch(&tmpdir.path().join("missing"), RecursiveMode::Recursive)
-            .expect_err("watch missing path");
-        assert!(matches!(err.kind, ErrorKind::PathNotFound));
-        assert_eq!(runloop_thread_id(&watcher.watcher), thread_id);
-
-        let path = tmpdir.path().join("entry");
-        std::fs::File::create_new(&path).expect("create");
-        rx.wait_unordered([expected(path).create_file()]);
-    }
-
-    #[test]
     fn nested_watch_keeps_receiving_after_unwatching_its_parent() {
         let tmpdir = testdir();
         let child = tmpdir.path().join("child");
@@ -1324,6 +2155,124 @@ mod tests {
         std::fs::File::create_new(&path).expect("create");
 
         rx.wait_unordered([expected(path).create_file()]);
+    }
+
+    // With `NoDefer`, the first event after a quiet period is delivered at once
+    // and the next is held for the latency; watching another path in that
+    // window replaces the stream, which must not drop the held event. The test
+    // first waits a part of the latency and checks the event really is held:
+    // by then the service has queued it for the old stream, so a new stream
+    // starting from now cannot deliver it, only the old stream's flush or the
+    // new stream's replay can. Only events on its own path count, so other
+    // tests' FSEvents traffic cannot satisfy or fail it.
+    fn assert_held_event_survives_a_stream_swap(mechanism: SwapMechanism) {
+        const LATENCY: Duration = Duration::from_secs(3);
+        const HELD_CHECK: Duration = Duration::from_secs(1);
+        // A replayed event goes through the new stream's runloop after the
+        // swap returns, and its delivery may itself be held for the latency.
+        const AFTER_SWAP_MARGIN: Duration = Duration::from_secs(2);
+        const LATE_ARRIVAL_WAIT: Duration = Duration::from_secs(10);
+
+        let tmpdir = testdir();
+        let watched = tmpdir.path().join("watched");
+        let added = tmpdir.path().join("added");
+        std::fs::create_dir(&watched).expect("create watched");
+        std::fs::create_dir(&added).expect("create added");
+
+        let (mut watcher, mut rx) = channel_with_config::<FsEventWatcher>(
+            ChannelConfig::default()
+                .with_timeout(Duration::from_secs(10))
+                .with_watcher_config(Config::default().with_fsevent_latency(LATENCY)),
+        );
+        watcher.watcher.swap_mechanism = mechanism;
+        watcher.watch_recursively(&watched);
+
+        let first = watched.join("first");
+        std::fs::File::create_new(&first).expect("create first");
+        rx.wait_unordered([expected(&first).create_file()]);
+
+        let held = watched.join("held");
+        let is_held_creation = |event: &Event| expected(&held).create_file() == *event;
+        std::fs::File::create_new(&held).expect("create held");
+        let held_created = Instant::now();
+        fsevent_debug!("test: created {}", held.display());
+
+        let check_ends = held_created + HELD_CHECK;
+        loop {
+            let remaining = check_ends.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.rx.recv_timeout(remaining) {
+                Ok(Ok(event)) => assert!(
+                    !is_held_creation(&event),
+                    "the event was delivered {:?} after it happened, inside the {LATENCY:?} \
+                     latency, so it was never held and the swap below proves nothing",
+                    held_created.elapsed()
+                ),
+                Ok(Err(error)) => panic!("watcher error before the swap: {error:?}"),
+                Err(_) => break,
+            }
+        }
+
+        fsevent_debug!("test: swapping streams with {mechanism:?}");
+        let swap_started = Instant::now();
+        watcher.watch_recursively(&added);
+        let swap_returned = Instant::now();
+        let swap_took = swap_returned - swap_started;
+        fsevent_debug!("test: swap took {swap_took:?}");
+
+        let deadline = swap_returned + LATENCY + AFTER_SWAP_MARGIN;
+        let late_arrival_ends = swap_returned + LATE_ARRIVAL_WAIT;
+        loop {
+            let remaining = late_arrival_ends.saturating_duration_since(Instant::now());
+            match rx.rx.recv_timeout(remaining) {
+                Ok(Ok(event)) if is_held_creation(&event) => {
+                    let arrived = Instant::now();
+                    fsevent_debug!(
+                        "test: held event arrived {:?} after it happened, {:?} after the swap \
+                         returned",
+                        arrived - held_created,
+                        arrived.saturating_duration_since(swap_returned)
+                    );
+                    assert!(
+                        arrived <= deadline,
+                        "the held event arrived {:?} after it happened and {:?} after the swap \
+                         returned (the swap took {swap_took:?}), later than the {LATENCY:?} \
+                         latency plus {AFTER_SWAP_MARGIN:?}",
+                        arrived - held_created,
+                        arrived - swap_returned
+                    );
+                    return;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("watcher error after the swap: {error:?}"),
+                Err(_) => panic!(
+                    "the held event was lost with {mechanism:?}: nothing for it \
+                     {LATE_ARRIVAL_WAIT:?} after a swap that took {swap_took:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn event_held_for_latency_survives_a_stream_swap() {
+        assert_held_event_survives_a_stream_swap(SwapMechanism::FlushAndReplay);
+    }
+
+    // The two mechanisms the swap combines, each alone, so a Mac run shows
+    // which one delivers the held event. Run them with
+    // `NOTIFY_FSEVENT_DEBUG=1 cargo test -p notify --lib held_event_with -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "diagnostic: shows whether the flush alone delivers a held event"]
+    fn held_event_with_flush_only_survives_a_stream_swap() {
+        assert_held_event_survives_a_stream_swap(SwapMechanism::FlushOnly);
+    }
+
+    #[test]
+    #[ignore = "diagnostic: shows whether the replay alone delivers a held event"]
+    fn held_event_with_replay_only_survives_a_stream_swap() {
+        assert_held_event_survives_a_stream_swap(SwapMechanism::ReplayOnly);
     }
 
     #[test]
@@ -1425,6 +2374,108 @@ mod tests {
         // sensitive on some systems. Dropping the last reference to the runloop will release it.
     }
 
+    // Regression test for a lost `CFRunLoopStop`: stopping is a no-op while the
+    // runloop thread is between publishing its handles and actually entering
+    // `CFRunLoopRun`, so a single stop could leave the thread parked forever and
+    // deadlock the join in `stop()`. Rapid watch/unwatch cycles maximize pressure
+    // on that window.
+    #[test]
+    fn rapid_watch_unwatch_does_not_hang() {
+        use std::sync::mpsc;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dir_a = tmpdir.path().join("a");
+        let dir_b = tmpdir.path().join("b");
+        std::fs::create_dir(&dir_a).expect("create_dir a");
+        std::fs::create_dir(&dir_b).expect("create_dir b");
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let stress_thread = thread::spawn(move || {
+            let (tx, _rx) = mpsc::channel::<crate::Result<Event>>();
+            let mut watcher = FsEventWatcher::new(tx, Default::default()).unwrap();
+            for _ in 0..500 {
+                // Errors are tolerated: under load (e.g. the 4096-path test running
+                // concurrently) fseventsd transiently refuses stream starts even for
+                // tiny path sets. The property under test is purely that none of
+                // these operations hangs.
+                let _ = watcher.watch(&dir_a, RecursiveMode::NonRecursive);
+                let _ = watcher.watch(&dir_b, RecursiveMode::NonRecursive);
+                let _ = watcher.unwatch(&dir_a);
+                let _ = watcher.unwatch(&dir_b);
+            }
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("rapid watch/unwatch timed out (lost CFRunLoopStop?)");
+        stress_thread.join().expect("stress thread to shut down");
+    }
+
+    // Deterministic test of the race window above: a stop source signaled
+    // before `CFRunLoopRun` is entered must still stop the loop, because
+    // source signals stay pending until the loop processes them.
+    #[test]
+    fn stop_source_signaled_before_runloop_run_still_stops_loop() {
+        use std::sync::mpsc;
+
+        struct CFSendWrapper<T: cf::Type>(cf::CFRetained<T>);
+        unsafe impl<T: cf::Type> Send for CFSendWrapper<T> {}
+
+        let (handles_tx, handles_rx) = mpsc::channel();
+        let (signaled_tx, signaled_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+
+        let loop_thread = thread::spawn(move || {
+            let cur_runloop = cf::CFRunLoop::current().expect("current runloop");
+
+            let mut stop_source_context = cf::CFRunLoopSourceContext {
+                version: 0,
+                info: ptr::null_mut(),
+                retain: None,
+                release: None,
+                copyDescription: None,
+                equal: None,
+                hash: None,
+                schedule: None,
+                cancel: None,
+                perform: Some(stop_runloop_perform),
+            };
+            let stop_source = unsafe {
+                cf::CFRunLoopSource::new(cf::kCFAllocatorDefault, 0, &mut stop_source_context)
+                    .expect("stop source to be created")
+            };
+            let mode = unsafe { cf::kCFRunLoopDefaultMode.expect("default runloop mode") };
+            cur_runloop.add_source(Some(&stop_source), Some(mode));
+
+            handles_tx
+                .send((
+                    CFSendWrapper(cur_runloop),
+                    CFSendWrapper(stop_source.clone()),
+                ))
+                .expect("send runloop handles");
+
+            signaled_rx
+                .recv()
+                .expect("wait for the stop source to be signaled");
+
+            cf::CFRunLoop::run();
+
+            stop_source.invalidate();
+            let _ = done_tx.send(());
+        });
+
+        let (runloop, stop_source) = handles_rx.recv().expect("receive runloop handles");
+        stop_source.0.signal();
+        runloop.0.wake_up();
+        signaled_tx.send(()).expect("release the loop thread");
+
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("CFRunLoopRun did not exit; pre-run stop source signal was lost");
+        loop_thread.join().expect("loop thread to shut down");
+    }
+
     #[test]
     fn test_fsevent_watcher_drop() {
         use super::*;
@@ -1455,6 +2506,244 @@ mod tests {
         println!("in test: {} works", file!());
     }
 
+    // The same setup as `assert_held_event_survives_a_stream_swap`, with the
+    // watched root renamed instead of a file created inside it: the
+    // `RootChanged` event this produces has id 0, so neither the flush nor the
+    // replay can bring it back once the old stream is held and stopped.
+    #[test]
+    fn root_change_held_for_latency_survives_a_stream_swap() {
+        const LATENCY: Duration = Duration::from_secs(3);
+        const HELD_CHECK: Duration = Duration::from_secs(1);
+        const AFTER_SWAP_MARGIN: Duration = Duration::from_secs(2);
+        const LATE_ARRIVAL_WAIT: Duration = Duration::from_secs(10);
+
+        let tmpdir = testdir();
+        let root = tmpdir.path().join("root");
+        let moved = tmpdir.path().join("moved");
+        let added = tmpdir.path().join("added");
+        std::fs::create_dir(&root).expect("create root");
+        std::fs::create_dir(&added).expect("create added");
+
+        let (mut watcher, mut rx) = channel_with_config::<FsEventWatcher>(
+            ChannelConfig::default()
+                .with_timeout(Duration::from_secs(10))
+                .with_watcher_config(Config::default().with_fsevent_latency(LATENCY)),
+        );
+        watcher.watch_recursively(&root);
+
+        let first = root.join("first");
+        std::fs::File::create_new(&first).expect("create first");
+        rx.wait_unordered([expected(&first).create_file()]);
+
+        let is_root_change = |event: &Event| {
+            event.info() == Some("root changed")
+                && event.paths.as_slice() == std::slice::from_ref(&root)
+        };
+        std::fs::rename(&root, &moved).expect("rename root");
+        let renamed = Instant::now();
+        fsevent_debug!("test: renamed {} to {}", root.display(), moved.display());
+
+        let check_ends = renamed + HELD_CHECK;
+        loop {
+            let remaining = check_ends.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.rx.recv_timeout(remaining) {
+                // fseventsd may deliver a root change without waiting out the
+                // latency (macOS 27 does, within microseconds), and then there
+                // is nothing held for the swap to lose.
+                Ok(Ok(event)) if is_root_change(&event) => {
+                    println!(
+                        "inconclusive: the root change was delivered {:?} after the rename, \
+                         inside the {LATENCY:?} latency, so it was never held",
+                        renamed.elapsed()
+                    );
+                    return;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("watcher error before the swap: {error:?}"),
+                Err(_) => break,
+            }
+        }
+
+        fsevent_debug!("test: swapping streams");
+        let swap_started = Instant::now();
+        watcher.watch_recursively(&added);
+        let swap_returned = Instant::now();
+        let swap_took = swap_returned - swap_started;
+        fsevent_debug!("test: swap took {swap_took:?}");
+
+        let deadline = swap_returned + LATENCY + AFTER_SWAP_MARGIN;
+        let late_arrival_ends = swap_returned + LATE_ARRIVAL_WAIT;
+        loop {
+            let remaining = late_arrival_ends.saturating_duration_since(Instant::now());
+            match rx.rx.recv_timeout(remaining) {
+                Ok(Ok(event)) if is_root_change(&event) => {
+                    let arrived = Instant::now();
+                    fsevent_debug!(
+                        "test: root change arrived {:?} after the rename, {:?} after the swap \
+                         returned: {event:?}",
+                        arrived - renamed,
+                        arrived.saturating_duration_since(swap_returned)
+                    );
+                    assert!(
+                        arrived <= deadline,
+                        "the root change arrived {:?} after the swap returned (the swap took \
+                         {swap_took:?}), later than the {LATENCY:?} latency plus \
+                         {AFTER_SWAP_MARGIN:?}",
+                        arrived - swap_returned
+                    );
+                    return;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("watcher error after the swap: {error:?}"),
+                Err(_) => panic!(
+                    "the root change was lost: nothing for it {LATE_ARRIVAL_WAIT:?} after a \
+                     swap that took {swap_took:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn root_change_is_reported_once_and_only_for_still_watched_roots() {
+        let replaced = PathBuf::from("/replaced");
+        let unchanged = PathBuf::from("/unchanged");
+        let unwatched = PathBuf::from("/unwatched");
+        let removed = PathBuf::from("/removed");
+        let identity = |inode| RootIdentity::Present { device: 1, inode };
+        let mut recorded = HashMap::from([
+            (replaced.clone(), identity(10)),
+            (unchanged.clone(), identity(20)),
+            (removed.clone(), identity(40)),
+        ]);
+        let current = |path: &Path| match path.to_str() {
+            Some("/replaced") => identity(11),
+            Some("/unchanged") => identity(20),
+            _ => RootIdentity::Missing,
+        };
+        let previous_roots = [replaced.clone(), unchanged, unwatched, removed.clone()];
+
+        assert_eq!(
+            take_unreported_root_changes(&previous_roots, &mut recorded, current),
+            vec![&replaced, &removed]
+        );
+        assert_eq!(recorded[&replaced], identity(11));
+        assert_eq!(recorded[&removed], RootIdentity::Missing);
+        assert!(
+            take_unreported_root_changes(&previous_roots, &mut recorded, current).is_empty(),
+            "a reported change is not reported again"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_root_is_not_reported_and_keeps_its_recorded_identity() {
+        let root = PathBuf::from("/root");
+        let recorded_identity = RootIdentity::Present {
+            device: 1,
+            inode: 10,
+        };
+        let mut recorded = HashMap::from([(root.clone(), recorded_identity)]);
+        let previous_roots = [root.clone()];
+
+        assert!(
+            take_unreported_root_changes(&previous_roots, &mut recorded, |_| {
+                RootIdentity::Unreadable
+            })
+            .is_empty()
+        );
+        assert_eq!(recorded[&root], recorded_identity);
+        assert!(
+            take_unreported_root_changes(&previous_roots, &mut recorded, |_| recorded_identity)
+                .is_empty(),
+            "a root readable again with the same identity is not a change"
+        );
+    }
+
+    #[test]
+    fn a_root_under_an_ancestor_replaced_by_a_file_is_missing() {
+        let tmpdir = testdir();
+        let parent = tmpdir.path().join("parent");
+        let root = parent.join("root");
+        std::fs::create_dir_all(&root).expect("create root");
+        assert_ne!(RootIdentity::of(&root), RootIdentity::Missing);
+
+        std::fs::remove_dir_all(&parent).expect("remove parent");
+        std::fs::write(&parent, b"").expect("replace parent with a file");
+        assert_eq!(RootIdentity::of(&root), RootIdentity::Missing);
+    }
+
+    #[test]
+    fn delivered_root_change_is_not_reported_again_at_the_swap() {
+        let tmpdir = testdir();
+        let root = tmpdir.path().join("root");
+        std::fs::create_dir(&root).expect("create root");
+        let watched_identity = RootIdentity::of(&root);
+        assert_ne!(watched_identity, RootIdentity::Missing);
+        std::fs::rename(&root, tmpdir.path().join("moved")).expect("rename root");
+
+        let previous_roots = [root.clone()];
+        let mut undelivered = HashMap::from([(root.clone(), watched_identity)]);
+        assert_eq!(
+            take_unreported_root_changes(&previous_roots, &mut undelivered, RootIdentity::of),
+            vec![&root],
+            "a change no event covered is reported"
+        );
+
+        let identities = Arc::new(Mutex::new(HashMap::from([(
+            root.clone(),
+            watched_identity,
+        )])));
+        let root_path = root.to_str().expect("utf-8 temp path");
+        let events = run_callback_recording_roots(
+            recursive_watch(root_path),
+            None,
+            &[(root_path.as_bytes(), StreamFlags::ROOT_CHANGED.bits(), 0)],
+            Arc::new(StreamProgress::new(0, false)),
+            identities.clone(),
+        );
+        assert_eq!(events.len(), 1);
+        let mut identities = lock_ignoring_poison(&identities);
+        assert_eq!(identities[&root], RootIdentity::Missing);
+        assert!(
+            take_unreported_root_changes(&previous_roots, &mut identities, RootIdentity::of)
+                .is_empty()
+        );
+    }
+
+    // A rewatch of a root replaced in the meantime must not reset what the
+    // swap compares against, or the replacement goes unreported.
+    #[test]
+    fn swap_reports_a_root_replaced_before_a_rewatch() {
+        let tmpdir = testdir();
+        let root = tmpdir.path().join("root");
+        std::fs::create_dir(&root).expect("create root");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watcher = FsEventWatcher::new(tx, Config::default()).expect("create watcher");
+        watcher
+            .append_path(&root, RecursiveMode::Recursive)
+            .expect("watch root");
+
+        std::fs::rename(&root, tmpdir.path().join("moved")).expect("rename root");
+        std::fs::create_dir(&root).expect("recreate root");
+        watcher
+            .append_path(&root, RecursiveMode::Recursive)
+            .expect("rewatch root");
+
+        let previous_roots = [root.canonicalize().expect("canonical root")];
+        let events = watcher.root_change_events(&previous_roots);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].kind, EventKind::Remove(RemoveKind::Any));
+        assert_eq!(events[0].info(), Some("root changed"));
+        assert_eq!(events[0].paths, vec![root]);
+
+        assert!(
+            watcher.root_change_events(&previous_roots).is_empty(),
+            "the change is reported once"
+        );
+    }
+
     #[test]
     fn test_steam_context_info_send_and_sync() {
         fn check_send<T: Send + Sync>() {}
@@ -1468,6 +2757,38 @@ mod tests {
         recursive_info: HashMap<PathBuf, WatchInfo>,
         events: &[(&[u8], u32)],
     ) -> Vec<crate::Result<Event>> {
+        let events: Vec<_> = events
+            .iter()
+            .zip(0..)
+            .map(|(&(path, flags), event_id)| (path, flags, event_id))
+            .collect();
+        run_callback_with(
+            recursive_info,
+            None,
+            &events,
+            Arc::new(StreamProgress::new(0, false)),
+        )
+    }
+
+    /// Like `run_callback`, with explicit event ids, a replay filter and the
+    /// stream progress the callback records into.
+    fn run_callback_with(
+        recursive_info: HashMap<PathBuf, WatchInfo>,
+        replay: Option<ReplayFilter>,
+        events: &[(&[u8], u32, fs::FSEventStreamEventId)],
+        progress: Arc<StreamProgress>,
+    ) -> Vec<crate::Result<Event>> {
+        run_callback_recording_roots(recursive_info, replay, events, progress, Arc::default())
+    }
+
+    /// Like `run_callback_with`, recording root identities into `root_identities`.
+    fn run_callback_recording_roots(
+        recursive_info: HashMap<PathBuf, WatchInfo>,
+        replay: Option<ReplayFilter>,
+        events: &[(&[u8], u32, fs::FSEventStreamEventId)],
+        progress: Arc<StreamProgress>,
+        root_identities: Arc<Mutex<HashMap<PathBuf, RootIdentity>>>,
+    ) -> Vec<crate::Result<Event>> {
         use std::ffi::CString;
         use std::ptr;
 
@@ -1476,28 +2797,31 @@ mod tests {
 
         let context = Box::new(StreamContextInfo {
             event_handler,
-            recursive_info: Arc::new(Mutex::new(recursive_info)),
+            recursive_info: Arc::new(Mutex::new(Arc::new(recursive_info))),
             event_kinds: EventKindMask::ALL,
+            progress,
+            replay: Mutex::new(replay),
+            root_identities,
+            stream_number: 0,
         });
         let context_ptr = Box::into_raw(context) as *mut libc::c_void;
 
         let c_paths: Vec<CString> = events
             .iter()
-            .map(|(path, _)| CString::new(*path).expect("cstring"))
+            .map(|(path, _, _)| CString::new(*path).expect("cstring"))
             .collect();
         let path_ptrs: Vec<_> = c_paths.iter().map(|p| p.as_ptr()).collect();
         let event_paths = NonNull::new(path_ptrs.as_ptr() as *mut libc::c_void).unwrap();
 
         let flags_arr: Vec<fs::FSEventStreamEventFlags> = events
             .iter()
-            .map(|(_, flags)| *flags as fs::FSEventStreamEventFlags)
+            .map(|(_, flags, _)| *flags as fs::FSEventStreamEventFlags)
             .collect();
         let event_flags =
             NonNull::new(flags_arr.as_ptr() as *mut fs::FSEventStreamEventFlags).unwrap();
 
-        let ids_arr: Vec<fs::FSEventStreamEventId> = (0..events.len())
-            .map(|i| i as fs::FSEventStreamEventId)
-            .collect();
+        let ids_arr: Vec<fs::FSEventStreamEventId> =
+            events.iter().map(|(_, _, event_id)| *event_id).collect();
         let event_ids = NonNull::new(ids_arr.as_ptr() as *mut fs::FSEventStreamEventId).unwrap();
 
         let res = std::panic::catch_unwind(|| unsafe {
@@ -1581,6 +2905,258 @@ mod tests {
                     .all(|event| !event.as_ref().expect("callback event").need_rescan())
             );
         }
+    }
+
+    #[test]
+    fn flush_waits_for_its_own_generation() {
+        let mut state = FlushState::new(0, false);
+
+        let first = state.request();
+        assert!(!state.is_complete(first), "nothing has been flushed yet");
+
+        // A flush already running when the second request arrives took its
+        // generation before that request, so it must not complete it.
+        let running = state.pending();
+        let second = state.request();
+        state.answer(running, 0);
+        assert!(state.is_complete(first));
+        assert!(!state.is_complete(second));
+
+        let next = state.pending();
+        state.answer(next, 0);
+        assert!(state.is_complete(second));
+
+        // A late answer from an older flush never moves the counter back.
+        state.answer(running, 0);
+        assert!(state.is_complete(second));
+    }
+
+    // Signals to a runloop source coalesce, so one perform can answer several
+    // requests.
+    #[test]
+    fn one_flush_completes_every_request_made_before_it() {
+        let mut state = FlushState::new(0, false);
+        let first = state.request();
+        let second = state.request();
+
+        let generation = state.pending();
+        state.answer(generation, 0);
+        assert!(state.is_complete(first));
+        assert!(state.is_complete(second));
+    }
+
+    // An answered flush is not complete until the callback has handed over
+    // the last event the service had queued, which is how an event held for
+    // the latency gets through before the stream is stopped.
+    #[test]
+    fn flush_waits_for_the_queued_events_to_be_delivered() {
+        let mut state = FlushState::new(0, false);
+        state.record_delivery(10, Instant::now());
+
+        let generation = state.request();
+        state.answer(state.pending(), 12);
+        assert!(!state.is_complete(generation), "event 12 is still held");
+
+        state.record_delivery(11, Instant::now());
+        assert!(!state.is_complete(generation), "event 12 is still held");
+
+        // Zero-id events such as `RootChanged` never move delivery back.
+        state.record_delivery(0, Instant::now());
+        state.record_delivery(12, Instant::now());
+        assert!(state.is_complete(generation));
+    }
+
+    #[test]
+    fn flush_with_nothing_queued_completes_once_answered() {
+        let mut state = FlushState::new(0, false);
+        let generation = state.request();
+        assert!(!state.is_complete(generation));
+        state.answer(state.pending(), 0);
+        assert!(state.is_complete(generation));
+    }
+
+    #[test]
+    fn callback_records_the_highest_delivered_id() {
+        let mut recursive_info = HashMap::new();
+        recursive_info.insert(
+            PathBuf::from("/watched"),
+            WatchInfo {
+                is_recursive: true,
+                reported_path: PathBuf::from("/watched"),
+            },
+        );
+        let progress = Arc::new(StreamProgress::new(0, false));
+        // The unwatched path still counts: the service delivered it, so a
+        // flush must not wait for it again.
+        let events = run_callback_with(
+            recursive_info,
+            None,
+            &[
+                (
+                    b"/watched/a".as_slice(),
+                    StreamFlags::ITEM_CREATED.bits(),
+                    0,
+                ),
+                (
+                    b"/elsewhere/b".as_slice(),
+                    StreamFlags::ITEM_CREATED.bits(),
+                    1,
+                ),
+            ],
+            progress.clone(),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(lock_ignoring_poison(&progress.state).delivered, 1);
+    }
+
+    fn recursive_watch(path: &str) -> HashMap<PathBuf, WatchInfo> {
+        HashMap::from([(
+            PathBuf::from(path),
+            WatchInfo {
+                is_recursive: true,
+                reported_path: PathBuf::from(path),
+            },
+        )])
+    }
+
+    #[test]
+    fn replay_resumes_after_the_last_delivery_while_events_may_be_held() {
+        assert_eq!(replay_since(500, 900_000, true), Some(500));
+        // Idle: only the most recent ids, which an event still on its way from
+        // fseventsd would have.
+        assert_eq!(
+            replay_since(500, 900_000, false),
+            Some(900_000 - IDLE_REPLAY_EVENTS)
+        );
+        assert_eq!(replay_since(899_990, 900_000, false), Some(899_990));
+        // Never ahead of the current id, and never from the start of history.
+        assert_eq!(replay_since(950_000, 900_000, true), Some(900_000));
+        assert_eq!(replay_since(0, 5, true), None);
+        assert_eq!(
+            replay_since(5, fs::kFSEventStreamEventIdSinceNow, true),
+            None
+        );
+    }
+
+    #[test]
+    fn events_may_be_held_only_within_the_hold_window() {
+        let window = Duration::from_secs(4);
+        let mut state = FlushState::new(7, false);
+        let started = state.started_at;
+        assert!(state.may_hold_events(started + window, window));
+        assert!(!state.may_hold_events(started + window + Duration::from_millis(1), window));
+
+        state.record_delivery(9, started + Duration::from_secs(10));
+        assert!(state.may_hold_events(started + Duration::from_secs(13), window));
+        assert!(!state.may_hold_events(started + Duration::from_secs(15), window));
+
+        state.history_pending = true;
+        assert!(state.may_hold_events(started + Duration::from_secs(60), window));
+    }
+
+    fn replay_filter(
+        previous_watches: HashMap<PathBuf, WatchInfo>,
+        previous_delivered: fs::FSEventStreamEventId,
+    ) -> ReplayFilter {
+        ReplayFilter {
+            since_when: 100,
+            swap_event_id: 200,
+            previous_watches: Arc::new(previous_watches),
+            previous_progress: Arc::new(StreamProgress::new(previous_delivered, false)),
+            previous_stream: 1,
+        }
+    }
+
+    #[test]
+    fn replay_filter_keeps_only_what_the_old_stream_still_owed() {
+        let filter = replay_filter(recursive_watch("/old"), 150);
+        let old = Path::new("/old/file");
+        let added = Path::new("/added/file");
+        let plain = StreamFlags::ITEM_MODIFIED;
+
+        assert_eq!(
+            filter.skip(old, &plain, 120, 150),
+            Some(ReplaySkip::AlreadyDelivered)
+        );
+        assert_eq!(
+            filter.skip(old, &plain, 150, 150),
+            Some(ReplaySkip::AlreadyDelivered)
+        );
+        // Held by the old stream when it was stopped.
+        assert_eq!(filter.skip(old, &plain, 160, 150), None);
+        assert_eq!(
+            filter.skip(added, &plain, 160, 150),
+            Some(ReplaySkip::PredatesWatch)
+        );
+        assert_eq!(filter.skip(added, &plain, 201, 150), None);
+        // Delivered by the old stream during the overlap, after the swap id.
+        assert_eq!(
+            filter.skip(old, &plain, 230, 240),
+            Some(ReplaySkip::AlreadyDelivered)
+        );
+        assert_eq!(filter.skip(added, &plain, 230, 240), None);
+        assert_eq!(
+            filter.skip(old, &plain, 0, 150),
+            None,
+            "zero-id events are never replayed"
+        );
+    }
+
+    #[test]
+    fn replay_filter_keeps_an_ancestor_rescan_the_old_stream_still_owed() {
+        let filter = replay_filter(recursive_watch("/old"), 150);
+        let rescan = StreamFlags::MUST_SCAN_SUBDIRS | StreamFlags::USER_DROPPED;
+        for ancestor in [Path::new("/"), Path::new("/elsewhere")] {
+            // The old stream delivered it as a rescan although no watch matches.
+            assert_eq!(
+                filter.skip(ancestor, &rescan, 120, 150),
+                Some(ReplaySkip::AlreadyDelivered)
+            );
+            // Held by the old stream when it was stopped, so it is not treated
+            // as predating the watch.
+            assert_eq!(filter.skip(ancestor, &rescan, 160, 150), None);
+        }
+    }
+
+    #[test]
+    fn callback_replays_the_held_event_and_skips_the_rest() {
+        let mut watches = recursive_watch("/old");
+        watches.extend(recursive_watch("/added"));
+        let progress = Arc::new(StreamProgress::new(100, true));
+        let created = StreamFlags::ITEM_CREATED.bits() | StreamFlags::IS_FILE.bits();
+        let events = run_callback_with(
+            watches,
+            Some(replay_filter(recursive_watch("/old"), 150)),
+            &[
+                (b"/old/delivered".as_slice(), created, 140),
+                (b"/old/held".as_slice(), created, 160),
+                (b"/added/before".as_slice(), created, 170),
+                (b"/old".as_slice(), StreamFlags::HISTORY_DONE.bits(), 999),
+                (
+                    b"/old".as_slice(),
+                    StreamFlags::ROOT_CHANGED.bits() | StreamFlags::ITEM_REMOVED.bits(),
+                    0,
+                ),
+                (b"/added/after".as_slice(), created, 210),
+            ],
+            progress.clone(),
+        );
+
+        let paths: Vec<_> = events
+            .iter()
+            .map(|event| event.as_ref().expect("event").paths.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                vec![PathBuf::from("/old/held")],
+                vec![PathBuf::from("/old")],
+                vec![PathBuf::from("/added/after")],
+            ]
+        );
+        let state = lock_ignoring_poison(&progress.state);
+        assert_eq!(state.delivered, 210, "the HistoryDone id is not an event's");
+        assert!(!state.history_pending);
     }
 
     #[test]
