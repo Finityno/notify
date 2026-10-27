@@ -87,13 +87,13 @@ pub struct FsEventWatcher {
 struct WatchEntry {
     info: WatchInfo,
     cf_path: cf::CFRetained<cf::CFString>,
-    device: u64,
 }
 
 #[derive(Clone, Debug)]
 struct WatchInfo {
     is_recursive: bool,
     reported_path: PathBuf,
+    device: u64,
 }
 
 // The watch table a running stream's callback reads. A watch the stream already
@@ -352,14 +352,18 @@ impl ReplayFilter {
         // A rescan reported at an ancestor of the old stream's watches matches
         // none of them, but the old stream delivered it all the same; see
         // `callback_impl`. Rescans are rare, so the scan costs nothing.
+        let rescan = flags.contains(StreamFlags::MUST_SCAN_SUBDIRS);
         let old_stream_delivers = watch_for(&self.previous_watches, path).is_some()
-            || (flags.contains(StreamFlags::MUST_SCAN_SUBDIRS)
+            || (rescan
                 && self
                     .previous_watches
                     .keys()
                     .any(|watch_path| watch_path.starts_with(path)));
         if old_stream_delivers {
-            (event_id <= previous_delivered).then_some(ReplaySkip::AlreadyDelivered)
+            // A rescan after the watch call can cover the new watches too, which
+            // the old stream's progress says nothing about.
+            (event_id <= previous_delivered && !(rescan && event_id > self.swap_event_id))
+                .then_some(ReplaySkip::AlreadyDelivered)
         } else {
             (event_id <= self.swap_event_id).then_some(ReplaySkip::PredatesWatch)
         }
@@ -820,7 +824,12 @@ impl FsEventWatcher {
         let entry = &self.watches[&path];
         if let Some(runloop) = &self.runloop {
             let mut stream_watches = lock_ignoring_poison(&runloop.recursive_info);
-            if self.is_covered_by_stream(&path, entry.device, &stream_watches) {
+            // Asked of the running stream's own table, not `self.watches`:
+            // after a failed swap, that holds watches the kept stream was never
+            // started with.
+            if is_covered(&path, entry.info.device, |ancestor| {
+                stream_watches.get(ancestor)
+            }) {
                 // The stream already delivers these events, and its roots do not
                 // change, so only the callback's path representation and
                 // recursive mode are updated; a swap would cost a new stream for
@@ -830,26 +839,6 @@ impl FsEventWatcher {
             }
         }
         self.restart(call_started_event_id)
-    }
-
-    // Like `is_covered`, but by a recursive watch the running stream actually
-    // has: after a failed swap, `self.watches` holds watches the kept stream
-    // was never started with.
-    fn is_covered_by_stream(
-        &self,
-        path: &Path,
-        device: u64,
-        stream_watches: &HashMap<PathBuf, WatchInfo>,
-    ) -> bool {
-        path.ancestors().skip(1).any(|ancestor| {
-            stream_watches
-                .get(ancestor)
-                .is_some_and(|covering| covering.is_recursive)
-                && self
-                    .watches
-                    .get(ancestor)
-                    .is_some_and(|covering| covering.device == device)
-        })
     }
 
     fn unwatch_inner(&mut self, path: &Path) -> Result<()> {
@@ -1002,15 +991,15 @@ impl FsEventWatcher {
     // read-write, and asking again costs one call per swap.
     fn device_without_history(&mut self) -> Option<u64> {
         for entry in self.watches.values() {
-            if self.devices_with_history.contains(&entry.device) {
+            if self.devices_with_history.contains(&entry.info.device) {
                 continue;
             }
-            let has_history = libc::dev_t::try_from(entry.device)
+            let has_history = libc::dev_t::try_from(entry.info.device)
                 .is_ok_and(|device| unsafe { fs::FSEventsCopyUUIDForDevice(device).is_some() });
             if !has_history {
-                return Some(entry.device);
+                return Some(entry.info.device);
             }
-            self.devices_with_history.insert(entry.device);
+            self.devices_with_history.insert(entry.info.device);
         }
         None
     }
@@ -1210,28 +1199,20 @@ impl FsEventWatcher {
                 info: WatchInfo {
                     is_recursive: recursive_mode.is_recursive(),
                     reported_path: path.to_path_buf(),
+                    device,
                 },
                 cf_path,
-                device,
             },
         );
         Ok(canonical_path)
     }
 
-    // A recursive watch covers nested watches on the same volume. Non-recursive
-    // ancestors may filter out deeper events, and FSEvents may not cross mounts.
-    fn is_covered(&self, path: &Path, device: u64) -> bool {
-        path.ancestors().skip(1).any(|ancestor| {
-            self.watches
-                .get(ancestor)
-                .is_some_and(|covering| covering.info.is_recursive && covering.device == device)
-        })
-    }
-
     fn stream_roots(&self) -> impl Iterator<Item = (&PathBuf, &WatchEntry)> {
-        self.watches
-            .iter()
-            .filter(|(path, entry)| !self.is_covered(path, entry.device))
+        self.watches.iter().filter(|(path, entry)| {
+            !is_covered(path, entry.info.device, |ancestor| {
+                self.watches.get(ancestor).map(|covering| &covering.info)
+            })
+        })
     }
 
     #[cfg(test)]
@@ -1736,6 +1717,18 @@ unsafe fn callback_impl(
     }
 }
 
+// A recursive watch covers nested watches on the same volume. Non-recursive
+// ancestors may filter out deeper events, and FSEvents may not cross mounts.
+fn is_covered<'a>(
+    path: &Path,
+    device: u64,
+    watch_at: impl Fn(&Path) -> Option<&'a WatchInfo>,
+) -> bool {
+    path.ancestors().skip(1).any(|ancestor| {
+        watch_at(ancestor).is_some_and(|covering| covering.is_recursive && covering.device == device)
+    })
+}
+
 /// The watch an event at `path` belongs to, if any: the most specific of the
 /// path itself, its parent, or an ancestor watched recursively.
 ///
@@ -1873,6 +1866,7 @@ mod tests {
         WatchInfo {
             is_recursive,
             reported_path: PathBuf::from("/reported"),
+            device: 0,
         }
     }
 
@@ -2902,6 +2896,7 @@ mod tests {
             WatchInfo {
                 is_recursive: true,
                 reported_path: PathBuf::from("/watched/a"),
+                device: 0,
             },
         );
         recursive_info.insert(
@@ -2909,6 +2904,7 @@ mod tests {
             WatchInfo {
                 is_recursive: false,
                 reported_path: PathBuf::from("/watched/b"),
+                device: 0,
             },
         );
 
@@ -3035,6 +3031,7 @@ mod tests {
             WatchInfo {
                 is_recursive: true,
                 reported_path: PathBuf::from("/watched"),
+                device: 0,
             },
         );
         let progress = Arc::new(StreamProgress::new(0, false));
@@ -3067,6 +3064,7 @@ mod tests {
             WatchInfo {
                 is_recursive: true,
                 reported_path: PathBuf::from(path),
+                device: 0,
             },
         )])
     }
@@ -3167,7 +3165,15 @@ mod tests {
             // Held by the old stream when it was stopped, so it is not treated
             // as predating the watch.
             assert_eq!(filter.skip(ancestor, &rescan, 160, 150), None);
+            // After the watch call it can cover a newly watched subtree, which
+            // the old stream delivering later ids says nothing about.
+            assert_eq!(filter.skip(ancestor, &rescan, 230, 240), None);
         }
+        assert_eq!(
+            filter.skip(Path::new("/top/old/deep"), &rescan, 230, 240),
+            None,
+            "a rescan after the watch call is kept even under an old watch"
+        );
 
         // A rescan for a path only the new stream watches was never the old
         // stream's to deliver, however far the old stream got.
@@ -3230,6 +3236,7 @@ mod tests {
             WatchInfo {
                 is_recursive: true,
                 reported_path: PathBuf::from("/tmp"),
+                device: 0,
             },
         );
 
@@ -3271,6 +3278,7 @@ mod tests {
             WatchInfo {
                 is_recursive: true,
                 reported_path: PathBuf::from("/tmp"),
+                device: 0,
             },
         );
 
